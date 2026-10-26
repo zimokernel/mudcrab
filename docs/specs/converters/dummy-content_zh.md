@@ -1,0 +1,184 @@
+# 合成夹具 (`dummy-content`)
+
+`dummy-content` 生成确定性的、按程序构建的 Skyrim 格式文件，以便贡献者
+无需本地游戏安装即可开发、测试和演示转换器，无需接触
+受版权保护的资产。不会读取、复制或要求任何游戏数据。
+
+曲目 [`issue #2`](https://github.com/Mudcrab-Team/mudcrab/issues/2)。
+
+## 快速开始
+
+```bash
+# 生成一个合成数据目录
+Cargo run -p 虚拟内容 -- gen Data
+
+# 与真实管道进行转换
+货物运行-p转换器--bin转换器--数据modern_assets
+```
+
+The second command produces the same layout the launcher/engine expect from a full conversion:
+`modern_assets/` with KTX2 textures, Luau scripts, a GLB mesh, `skyrim_world.db`,
+`cell_cache.rkyv`, `vfs/`, the ingestion cache and `conversion-manifest.json`
+(`complete: true`). The engine can then inspect the generated world:
+
+```bash
+货物运行-p引擎--bin世界检查--modern_assets 1 0 0--radius 1
+```
+
+or open it in the engine. The fixture's worldspace has form id `1`, and the engine's default is
+Skyrim's Tamriel, so name it:
+
+```bash
+货物运行-p引擎--bin引擎--资产modern_assets--worldspace 1
+```
+
+## CLI
+
+```text
+虚拟内容 gen <输出目录> [--seed <n>] [--formats <列表>] [--force]
+                  [--带内部| --带灯]
+```
+
+- `--seed <n>` — seed for all generated texture content (SplitMix64). The default is stable.
+- `--formats dds,pex,nif,bsa,ba2,esm,lodsettings` — restrict output. The default generates everything. `lodsettings` requires `esm`.
+- `--force` — allow writing into a non-empty directory. Existing generated files are replaced
+  atomically; unrelated files are left untouched. Generation refuses to follow symlinked path
+  components.
+- `--with-interior` — replace `Skyrim.esm` with the interior preset (needs `esm`): one exterior
+  cell of the generated worldspace, its auto-load door into one interior cell, and the return
+  door. The plugin is written through the same atomic, symlink-refusing writer as every other
+  generated file.
+- `--with-lights` — replace `Skyrim.esm` with the light preset (needs `esm`): one exterior cell
+  of the generated worldspace, one `LIGH` base record, and the single reference that places it,
+  carrying the light's own `XRDS` radius. Written through the same writer as every other
+  generated file.
+
+The two presets each replace `Skyrim.esm`, so they are alternatives: passing both is an error.
+The `esm` format has to be included for either.
+
+## Generated tree
+
+| Path | Content |
+| :--- | :--- |
+| `scripts/generated.pex`, `scripts/second.pex` | Minimal Papyrus `3.2` scripts (magic `0xFA57C0DE`, big-endian header). |
+| `textures/generated_color.dds` | BC1 color texture, 64×64, 7 mips. |
+| `textures/generated_normal.dds` | BC5 normal texture, 64×64, 7 mips. |
+| `textures/generated_color_x8.dds` | Uncompressed `X8R8G8B8` texture, 32×32, 6 mips. |
+| `textures/generated_cube.dds` | BC1 cube map, 32×32, 6 mips, six faces. |
+| `textures/generated_volume.dds` | BC1 volume texture, 16×16×16, 5 mips. |
+| `textures/landscape/dirt02.dds` | BC1 texture, 64×64, 7 mips; stand-in for Skyrim's default land texture, which terrain LOD paints on quadrants with no base texture. |
+| `meshes/generated.nif` | Skyrim SE `20.2.0.7` static quad with a lighting shader and texture set. |
+| `Skyrim - Misc.bsa` | SSE `v105` BSA (24-byte folder records) with zlib payloads. |
+| `Skyrim - Meshes.bsa` | SSE `v105` BSA containing the generated NIF. |
+| `Skyrim - Textures.ba2` | Version 1 `GNRL` BA2 with zlib payloads. |
+| `Skyrim.esm` | Worldspace with a 3×3 exterior cell grid, flat LAND terrain, one static and one placement reference per cell. With `--with-interior`, one exterior cell, an interior cell and a reciprocal `DOOR`/`XTEL` pair instead. With `--with-lights`, one exterior cell, one `LIGH` base record and the one `REFR` that places it with an `XRDS` radius override. |
+| `lodsettings/GeneratedWorld.lod` | 16-byte Skyrim sidecar: `i16 X/Y`, then `i32 stride/min-level/max-level`. |
+
+## Library API
+
+The crate can be consumed directly (it is used by converter tests as a dev-dependency):
+
+```rust
+使用 dummy_content::{Entry, bsa};
+
+让存档 = bsa::v105(
+    &[条目::new("scripts/hello.pex", b"PEX")],
+    bsa::压缩::Zlib,
+）？；
+# 好的::<(), color_eyre::报告>(())
+```
+
+Supported writers:
+
+- `dds`: `X8R8G8B8`, BC1, BC5, BC7; mip chains, cube maps and volume textures with strict
+  validation (mip bounds, block alignment, non-zero dimensions).
+- `pex`: minimal Skyrim `3.2` script; validates the object name.
+- `bsa`: `v105` (default) and `v104`, compression `None`, `Zlib` or `Lz4` (`Lz4` is rejected for
+  `v104`). Entries are grouped by folder in first-seen order.
+- `ba2`: version 1 `GNRL` (`None`/`Zlib`) and version 1 `DX10` (one chunk per texture).
+- `nif`: Skyrim SE `20.2.0.7` static shapes (`BSFadeNode` + `BSTriShape` +
+  `BSLightingShaderProperty` + `BSShaderTextureSet`) with validated geometry.
+- `esm`: a minimal plugin (`TES4`, `WRLD`, `CELL`, `LAND`, `STAT`, `REFR`, `TXST`, `LTEX`),
+  optionally with an interior cell and a reciprocal `DOOR`/`XTEL` load door pair
+  (`esm::PRESET_INTERIOR`, `esm::plugin_with_interior`), or with a `LIGH` base record whose
+  `DATA` is the 48-byte layout `Skyrim.esm` uses, an `FNAM` fade and one reference carrying an
+  `XRDS` radius override (`esm::PRESET_LIGHT`, `esm::plugin_with_lights`). Exports into
+  `skyrim_world.db` (the current `shared::WORLD_DATABASE_SCHEMA_VERSION`) and `cell_cache.rkyv`.
+  `esm::texture_set(form_id, slots)` generates a standalone TXST record to append to a plugin;
+  the eight optional array entries name physical TX00 through TX07 slots independently of
+  converter column order. Omitted entries produce no corresponding subrecord.
+- `layout`: the `Data/` tree above, with atomic publication and symlink refusal. `layout::generate`
+  writes the default tree and `layout::write_plugin` publishes a caller-built `Skyrim.esm` —
+  the interior preset included — through the same writer and the same constants
+  (`GENERATED_AUTHOR`, `GENERATED_WORLDSPACE`, `GENERATED_MODEL_PATH`, `GENERATED_DIFFUSE_PATH`,
+  `GENERATED_NORMAL_PATH`).
+
+Output is byte-for-byte deterministic per seed, which makes fixtures safe to use in golden tests.
+
+## Intentional deviations
+
+Some writers emit layouts that the current converter accepts rather than what a retail game
+client would consume; the [ADRs](../../adr/README.md) record the reasoning:
+
+- BSA/BA2 name hashes are zero: the converter resolves entries by table order.
+- Cube maps use the legacy `caps2` six-layer layout because the converter rejects spec-standard
+  DX10 cube maps.
+- `X8R8G8B8` fixtures are 2D only; cube/volume fixtures use block-compressed formats.
+- The generated worldspace is intentionally minimal: flat terrain (no `VNML`/`VCLR`/`VTXT`),
+  a single static and one reference per cell.
+- The `--with-interior` preset writes each `DOOR` base record with the `MODL` a retail plugin
+  carries. The existing exporter already includes `DOOR` in `statics`, so the door references
+  resolve to their model paths in `skyrim_world.db`. `crates/converter/tests/fixture_interior_pipeline.rs`
+  verifies that the static and both door references have exported models.
+- `XTEL` destination FormIDs are written as the fixture's own local IDs. The converter's
+  load-order remap rewrites them into load-order numbering like each reference's own FormID,
+  so the door links survive any load-order slot. The single-plugin `dummy-content gen` case
+  occupies index 0, where these values are unchanged. Nothing consumes `XTEL` yet.
+- `XESP` is a four-byte parent FormID, one flags byte and three unused bytes.
+  The exporter projects byte 4 only, preserving the unused bytes in canonical payloads.
+- A light reference's `XRDS` is a single little-endian `f32` rather than a FormID, so the
+  load-order remap leaves it alone and a reader gets the value as written. The base record's
+  `DATA` puts the radius at bytes 4..8 (`u32`), the colour at 8..11, the flags at 12..16 (`u32`)
+  and the falloff exponent at 16..20 (`f32`); `FNAM` is the fade (`f32`).
+
+## Validating with a local game install
+
+Real-asset checks stay opt-in and never run in CI with proprietary data. Point them at an
+**unmodded** `Data` directory (for example the Steam install):
+
+```bash
+导出 MUDCRAB_SKYRIM_DATA="$HOME/.local/share/Steam/steamapps/common/Skyrim 特别版/数据"
+导出 MUDCRAB_NIF_FIXTURE="/path/to/a/static.nif"
+货物测试-p转换器--忽略
+```
+
+The old `OPENSKYRIM_*` variable names are still accepted as a fallback.
+
+Mod-manager "Stock Game" directories are not suitable: their loose files are often modified.
+
+## Development
+
+```bash
+Cargo test -p dummy-content # 单元+集成测试
+货物 Clippy -p 虚拟内容 --all-targets --all-features -- -D 警告
+cargo bench -p dummy-content # 标准长凳
+货物测试 --release -p 虚拟内容 -- --忽略性能 # 发布预算
+```
+
+Security sweeps (truncation and mutation) for generated archives, DDS files and PEX scripts live
+in the converter unit tests; the generated pipeline is covered end to end by
+`crates/converter/tests/fixture_round_trip.rs`, and the `--with-interior` tree by
+`crates/converter/tests/fixture_interior_pipeline.rs` (which asserts the exported world's
+`references_without_model` count) together with the parser-level checks in
+`crates/converter/tests/fixture_doors.rs`. The `--with-lights` plugin's `LIGH` `DATA`/`FNAM`
+bytes and its reference's `XRDS` are read back by `crates/converter/tests/fixture_lights.rs`.
+
+Property tests (`proptest`, fixed seed, run by the normal test suite) extend those sweeps: the
+ESM, VMAD, LAND, BSA, BA2, PEX, LIP and NIF parsers must return an error, never panic or abort,
+on arbitrary bytes and on generated fixtures with overwritten bytes, extreme size and count
+words, and truncation. Shared strategies live in `crates/converter/src/test_strategies.rs`.
+
+## Regression invariant
+
+- §B1 (2026-09-28): The LOD sidecar parser and writer referenced a selector missing from `Formats`, which stopped the workspace from compiling.
+- §V1: Every generated format is represented by `Formats`, `Formats::parse`, `Formats::all`, and the output filter; `lodsettings` requires `esm`. The layout tests cover the default tree, sidecar bytes, and invalid dependency.
