@@ -1,0 +1,411 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "command": "finalize",
+  "status": "fail",
+  "type": "architecture",
+  "quality": "showcase",
+  "startedAt": "2026-10-10T06:04:01.435Z",
+  "specification": {
+    "path": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\candidate.json",
+    "sha256": "9856ed129f73fa504b8492b3cb37b93074b2fb1989a12097dc760318d3f9754a",
+    "bytes": 6410
+  },
+  "artifact": {
+    "path": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.html",
+    "sha256": "40b7e5b887784fce9d94f82ca862e59dc51401e9633c183f57b60394840b3c5f",
+    "bytes": 770807
+  },
+  "stages": {
+    "validate": {
+      "status": "pass",
+      "exitCode": 0,
+      "durationMs": null,
+      "execution": "embedded-in-deliver",
+      "command": [
+        "C:\\Program Files\\nodejs\\node.exe",
+        "C:\\Users\\Administrator\\.agents\\skills\\archify\\bin\\archify.mjs",
+        "deliver",
+        "architecture",
+        "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\candidate.json",
+        "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.html",
+        "--quality",
+        "showcase",
+        "--repo-root",
+        "D:\\work\\ttc\\mudcrab",
+        "--json"
+      ],
+      "receipt": {
+        "schemaVersion": 1,
+        "ok": true,
+        "command": "validate",
+        "specification": {
+          "sha256": "9856ed129f73fa504b8492b3cb37b93074b2fb1989a12097dc760318d3f9754a",
+          "bytes": 6410
+        },
+        "validation": {
+          "checksPassed": 9,
+          "checkCount": 9,
+          "compositionProfile": "showcase",
+          "compositionStatus": "pass",
+          "errors": 0,
+          "warnings": 0
+        }
+      }
+    },
+    "deliver": {
+      "status": "pass",
+      "exitCode": 0,
+      "durationMs": 1884,
+      "command": [
+        "C:\\Program Files\\nodejs\\node.exe",
+        "C:\\Users\\Administrator\\.agents\\skills\\archify\\bin\\archify.mjs",
+        "deliver",
+        "architecture",
+        "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\candidate.json",
+        "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.html",
+        "--quality",
+        "showcase",
+        "--repo-root",
+        "D:\\work\\ttc\\mudcrab",
+        "--json"
+      ],
+      "receipt": {
+        "schemaVersion": 1,
+        "receiptId": "f6a2098e-42e3-464e-a55d-ed6bfdce3145",
+        "ok": true,
+        "command": "deliver",
+        "type": "architecture",
+        "input": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\candidate.json",
+        "output": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.html",
+        "specification": {
+          "sha256": "9856ed129f73fa504b8492b3cb37b93074b2fb1989a12097dc760318d3f9754a",
+          "bytes": 6410
+        },
+        "artifact": {
+          "sha256": "40b7e5b887784fce9d94f82ca862e59dc51401e9633c183f57b60394840b3c5f",
+          "bytes": 770807
+        },
+        "validation": {
+          "checksPassed": 9,
+          "checkCount": 9,
+          "compositionProfile": "showcase",
+          "compositionStatus": "pass",
+          "errors": 0,
+          "warnings": 0
+        },
+        "evidence": {
+          "verified": true,
+          "repository": "https://github.com/Mudcrab-Team/mudcrab",
+          "revision": "68b5023a2f80e44dda0fe801523fb46be81d4dba",
+          "references": 11
+        },
+        "update": {
+          "status": "unavailable",
+          "installedVersion": null,
+          "availableVersion": null,
+          "releaseNotes": null,
+          "checkedAt": null,
+          "source": null,
+          "noticeRequired": false,
+          "noticeText": null,
+          "reason": "disabled"
+        }
+      }
+    },
+    "check": {
+      "status": "pass",
+      "exitCode": 0,
+      "durationMs": 330,
+      "command": [
+        "C:\\Program Files\\nodejs\\node.exe",
+        "C:\\Users\\Administrator\\.agents\\skills\\archify\\bin\\archify.mjs",
+        "check",
+        "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.html",
+        "--require-provenance"
+      ],
+      "receipt": {
+        "ok": true,
+        "file": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.html",
+        "artifact": {
+          "sha256": "40b7e5b887784fce9d94f82ca862e59dc51401e9633c183f57b60394840b3c5f",
+          "bytes": 770807
+        },
+        "checks": [
+          {
+            "name": "single_svg",
+            "ok": true,
+            "details": [
+              "found 1 <svg> block(s)"
+            ]
+          },
+          {
+            "name": "finite_svg",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "orthogonal_arrows",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "label_route_clearance",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "relationship_crossings",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "relationship_corridors",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "container_border_runs",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "route_rhythm",
+            "ok": true,
+            "details": []
+          },
+          {
+            "name": "legend_clearance",
+            "ok": true,
+            "details": []
+          }
+        ],
+        "composition": {
+          "schemaVersion": 1,
+          "profile": "showcase",
+          "status": "pass",
+          "summary": {
+            "errors": 0,
+            "warnings": 0
+          },
+          "metrics": {
+            "properCrossings": 0,
+            "resolvedCrossovers": 0,
+            "ambiguousCorridors": 0,
+            "arrowheadCollisions": 0,
+            "containerBorderRuns": 0,
+            "labelRouteClearanceIssues": 0,
+            "labelCanvasOverflowIssues": 0,
+            "minLabelRouteClearance": 21.1,
+            "desktopReadabilityIssues": 0,
+            "viewportHeightIssues": 0,
+            "minProjectedNodeTextPx": 7.5,
+            "maxBends": 4,
+            "routesOverSuggestedBends": 2,
+            "maxStretch": 1.317,
+            "routesOverSuggestedStretch": 0,
+            "minSegmentPx": 16,
+            "minInteriorSegmentPx": 16,
+            "shortSegmentCount": 0,
+            "shortEndpointSegmentCount": 0,
+            "shortInteriorSegmentCount": 0,
+            "microSegmentCount": 0
+          },
+          "suggestedLimits": {
+            "bendsPerRelationship": 2,
+            "stretch": 1.35,
+            "segmentPx": 16,
+            "microSegmentPx": 8
+          },
+          "routeReview": {
+            "crossings": [],
+            "detours": [
+              {
+                "relationship": {
+                  "id": "launcher-os",
+                  "from": "launcher",
+                  "to": "os",
+                  "label": "Command::spawn",
+                  "collectionIndex": 1,
+                  "artifactIndex": 2
+                },
+                "bends": 4,
+                "stretch": 1.24
+              },
+              {
+                "relationship": {
+                  "id": "assets-engine",
+                  "from": "asset_pack",
+                  "to": "engine",
+                  "label": "读取运行时资产",
+                  "collectionIndex": 7,
+                  "artifactIndex": 8
+                },
+                "bends": 4,
+                "stretch": 1.317
+              }
+            ]
+          },
+          "leadingSpace": {
+            "measured": true,
+            "emptyTopPx": 70,
+            "emptyTopRatio": 0.121,
+            "occupiedTop": 70,
+            "viewBoxTop": 0,
+            "canvasHeight": 577,
+            "typicalNodeHeight": 64,
+            "reviewSuggested": false
+          },
+          "desktopReadability": {
+            "budgetBasis": "recognized-declared-wide",
+            "readerContract": "declared-wide-v1",
+            "availableDiagramWidth": 1331.25,
+            "actualBudgetPx": 1331.25,
+            "actualReaderWidth": 1361.25,
+            "desiredReaderWidth": 1361.25,
+            "viewportCap": 1376,
+            "limit": "source-size",
+            "requestedTargetPx": 7.5,
+            "requestedTargetMet": true,
+            "hardFloorPx": 6,
+            "hardFloorMet": true,
+            "minimumOwner": {
+              "kind": "edge",
+              "id": "user-launcher",
+              "from": "user",
+              "to": "launcher"
+            },
+            "minimumSourceTextPx": 8,
+            "minimumProjectedTextPx": 7.5,
+            "semanticTextCount": 33
+          },
+          "issues": []
+        },
+        "provenance": "current",
+        "deliveryReceiptId": "f6a2098e-42e3-464e-a55d-ed6bfdce3145"
+      }
+    },
+    "browser-check": {
+      "status": "fail",
+      "exitCode": 1,
+      "durationMs": 32,
+      "command": [
+        "C:\\Program Files\\nodejs\\node.exe",
+        "C:\\Users\\Administrator\\.agents\\skills\\archify\\bin\\archify.mjs",
+        "browser-check",
+        "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.html",
+        "--json",
+        "--require-provenance"
+      ],
+      "execution": "in-process",
+      "receipt": {
+        "schemaVersion": 1,
+        "ok": false,
+        "command": "browser-check",
+        "evidenceKind": "automated-browser",
+        "status": "fail",
+        "visualReview": "not-requested",
+        "provenance": "current",
+        "deliveryReceiptId": "f6a2098e-42e3-464e-a55d-ed6bfdce3145",
+        "artifact": {
+          "path": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.html",
+          "sha256": "40b7e5b887784fce9d94f82ca862e59dc51401e9633c183f57b60394840b3c5f",
+          "bytes": 770807
+        },
+        "state": {
+          "detail": "read",
+          "motion": "still"
+        },
+        "chrome": {
+          "status": "not-checked",
+          "executable": null
+        },
+        "diagnostics": [
+          {
+            "code": "viewer/evidence-path-conflict",
+            "severity": "error",
+            "message": "browser-check will not replace the existing unowned evidence path \"D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.browser-check.json\".",
+            "subject": {
+              "artifact": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.html",
+              "evidencePath": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.browser-check.json"
+            },
+            "evidence": {
+              "reason": {
+                "code": "ownership-artifact-mismatch"
+              }
+            },
+            "supportedFixes": [
+              "move the conflicting file aside, or choose a separate --out-dir, then rerun browser-check"
+            ]
+          }
+        ],
+        "containment": {
+          "status": "fail",
+          "policy": "fit-or-reader-declared-readable-vertical-scroll",
+          "viewports": []
+        },
+        "themeStates": {
+          "status": "fail",
+          "viewports": []
+        },
+        "readability": {
+          "status": "fail",
+          "minimumProjectedNodeTextPx": 6,
+          "viewports": []
+        },
+        "viewerChrome": {
+          "status": "fail",
+          "viewports": []
+        },
+        "captures": {
+          "status": "not-requested",
+          "screenshots": [],
+          "contactSheet": null
+        },
+        "sidecars": {
+          "receipt": "mudcrab-runtime.browser-check.json",
+          "files": []
+        },
+        "error": "browser-check will not replace the existing unowned evidence path \"D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.browser-check.json\"."
+      }
+    }
+  },
+  "diagnostics": [
+    {
+      "code": "viewer/evidence-path-conflict",
+      "severity": "error",
+      "message": "browser-check will not replace the existing unowned evidence path \"D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.browser-check.json\".",
+      "subject": {
+        "artifact": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.html",
+        "evidencePath": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.browser-check.json"
+      },
+      "evidence": {
+        "reason": {
+          "code": "ownership-artifact-mismatch"
+        }
+      },
+      "supportedFixes": [
+        "move the conflicting file aside, or choose a separate --out-dir, then rerun browser-check"
+      ]
+    }
+  ],
+  "evidence": {
+    "receipt": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.finalize.json",
+    "summaryReceipt": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.finalize-summary.json",
+    "browserCheckReceipt": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.browser-check.json"
+  },
+  "visualReview": "not-requested",
+  "failedStage": "browser-check",
+  "finishedAt": "2026-10-10T06:04:04.253Z",
+  "durationMs": 2817,
+  "update": {
+    "status": "current",
+    "installedVersion": "3.0.1",
+    "availableVersion": "3.0.1",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-09T12:37:50.530Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  }
+}

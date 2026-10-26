@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Mudcrab Engine Runtime · 未完成实现切片",
+    "locale": "zh-CN",
+    "output": ".archify/architecture-mudcrab-runtime-20261010-000000/mudcrab-runtime.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Mudcrab-Team/mudcrab.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "68b5023a2f80e44dda0fe801523fb46be81d4dba"
+    }
+  },
+  "components": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "玩家 / 操作者",
+      "sublabel": "输入控制与启动操作",
+      "pos": [40, 260],
+      "size": [150, 64]
+    },
+    {
+      "id": "launcher",
+      "type": "frontend",
+      "label": "Launcher",
+      "sublabel": "Bevy UI · 设置 / Play",
+      "pos": [280, 260],
+      "size": [165, 64],
+      "sources": [{ "path": "crates/launcher/src/main.rs", "line": 1, "end_line": 5 }]
+    },
+    {
+      "id": "converter",
+      "type": "backend",
+      "label": "Asset Converter",
+      "sublabel": "离线解析与转换",
+      "pos": [300, 100],
+      "size": [175, 64],
+      "sources": [{ "path": "crates/converter/src/pipeline.rs", "line": 222, "end_line": 249 }]
+    },
+    {
+      "id": "game_data",
+      "type": "external",
+      "label": "Skyrim Data",
+      "sublabel": "用户提供的游戏文件",
+      "pos": [40, 100],
+      "size": [150, 64]
+    },
+    {
+      "id": "asset_pack",
+      "type": "cloud",
+      "label": "本地运行时资产",
+      "sublabel": "GLB / KTX2 / DB / rkyv",
+      "pos": [570, 100],
+      "size": [190, 64],
+      "sources": [{ "path": "crates/engine/src/app.rs", "line": 96, "end_line": 123 }]
+    },
+    {
+      "id": "engine",
+      "type": "backend",
+      "label": "Engine Bootstrap",
+      "sublabel": "CLI · 资产校验 · 插件装配",
+      "pos": [570, 260],
+      "size": [200, 64],
+      "sources": [
+        { "path": "crates/engine/src/main.rs", "line": 6, "end_line": 18 },
+        { "path": "crates/engine/src/app.rs", "line": 62, "end_line": 95 }
+      ]
+    },
+    {
+      "id": "runtime_slice",
+      "type": "backend",
+      "label": "Runtime 实现切片",
+      "sublabel": "流送 · Vercidium 渲染 · 可选 WALK",
+      "pos": [875, 260],
+      "size": [220, 70],
+      "sources": [
+        { "path": "crates/engine/src/streaming.rs", "line": 72, "end_line": 113 },
+        { "path": "crates/engine/src/render.rs", "line": 116, "end_line": 146 },
+        { "path": "crates/engine/src/physics.rs", "line": 343, "end_line": 366 }
+      ]
+    },
+    {
+      "id": "sqlite",
+      "type": "database",
+      "label": "SQLite 世界库",
+      "sublabel": "异步单读工作线程",
+      "pos": [875, 425],
+      "size": [180, 64],
+      "sources": [{ "path": "crates/engine/src/world/database.rs", "line": 341, "end_line": 379 }]
+    },
+    {
+      "id": "gpu",
+      "type": "external",
+      "label": "GPU / wgpu 后端",
+      "sublabel": "宿主设备与驱动",
+      "pos": [1195, 260],
+      "size": [185, 64],
+      "sources": [{ "path": "crates/engine/src/renderer_init.rs", "line": 15, "end_line": 46 }]
+    },
+    {
+      "id": "os",
+      "type": "external",
+      "label": "操作系统",
+      "sublabel": "进程 / 窗口 / 文件 API",
+      "pos": [280, 445],
+      "size": [190, 64],
+      "sources": [{ "path": "crates/launcher/src/handlers.rs", "line": 145, "end_line": 169 }]
+    }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Mudcrab 本地应用与运行资产", "wraps": ["launcher", "converter", "asset_pack", "engine", "runtime_slice", "sqlite"] },
+    { "kind": "security-group", "label": "用户提供的外部数据", "wraps": ["game_data"] }
+  ],
+  "connections": [
+    { "id": "user-launcher", "from": "user", "to": "launcher", "label": "设置 / Play", "variant": "emphasis" },
+    { "id": "launcher-os", "from": "launcher", "to": "os", "label": "Command::spawn", "variant": "security", "fromSide": "bottom", "toSide": "top" },
+    { "id": "os-engine", "from": "os", "to": "engine", "label": "创建独立进程", "variant": "security" },
+    { "id": "game-data-converter", "from": "game_data", "to": "converter", "label": "读取原始资产", "variant": "security" },
+    { "id": "launcher-converter", "from": "launcher", "to": "converter", "label": "启动转换", "variant": "emphasis" },
+    { "id": "converter-assets", "from": "converter", "to": "asset_pack", "label": "发布转换结果", "variant": "emphasis" },
+    { "id": "launcher-engine", "from": "launcher", "to": "engine", "label": "启动 engine 子进程", "variant": "emphasis" },
+    { "id": "assets-engine", "from": "asset_pack", "to": "engine", "label": "读取运行时资产", "variant": "emphasis", "fromSide": "bottom", "toSide": "top" },
+    { "id": "engine-runtime", "from": "engine", "to": "runtime_slice", "label": "启动 Bevy App", "variant": "emphasis" },
+    { "id": "runtime-db", "from": "runtime_slice", "to": "sqlite", "label": "异步查询", "fromSide": "bottom", "toSide": "top" },
+    { "id": "runtime-gpu", "from": "runtime_slice", "to": "gpu", "label": "渲染后端", "variant": "emphasis" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "当前运行路径",
+      "items": [
+        "准备：用户数据 → 转换器 → 本地资产包 → Engine Bootstrap。",
+        "运行：Launcher 启动 engine 子进程；Bevy App 装配现有流送 / 渲染切片，世界查询走 SQLite 工作线程。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "信任与进程边界",
+      "items": [
+        "游戏文件由用户提供；转换器读取并在本地生成运行时资产。",
+        "Launcher 通过操作系统启动独立 engine 进程，并传入资产目录。",
+        "进程、窗口与文件系统由操作系统提供；GPU / wgpu 属宿主设备依赖；没有运行时云服务节点。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "成熟度与范围",
+      "items": [
+        "Engine 阶段仍未完成真实游戏资产验收；此图表示现有实现切片，不代表完整游戏运行时。",
+        "玩家 WALK / 物理插件受 interactive_world_physics 配置控制；不应理解为默认完整玩法。",
+        "SQLite 异步查询、资产流送与渲染已有代码；GLB / KTX2 等细节不另加连线。"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "a01c321d-12f8-4f70-bcac-b6cac3f86940",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\candidate.json",
+  "output": "D:\\work\\ttc\\mudcrab\\.archify\\architecture-mudcrab-runtime-20261010-000000\\mudcrab-runtime.html",
+  "specification": {
+    "sha256": "9856ed129f73fa504b8492b3cb37b93074b2fb1989a12097dc760318d3f9754a",
+    "bytes": 6410
+  },
+  "artifact": {
+    "sha256": "40b7e5b887784fce9d94f82ca862e59dc51401e9633c183f57b60394840b3c5f",
+    "bytes": 770807
+  }
+}
