@@ -236,6 +236,24 @@ where
         .collect())
 }
 
+fn deserialize_extensions<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<shared::extensions::ExtensionEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let (entries, issues) = shared::extensions::parse_entries(&value);
+    for issue in issues {
+        log::warn!(
+            "ignored optional capability declaration {:?}: {}",
+            issue.id,
+            issue.reason
+        );
+    }
+    Ok(entries)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IngestedFile {
     pub path: String,
@@ -396,6 +414,13 @@ pub struct ConversionManifest {
         deserialize_with = "deserialize_derived_outputs"
     )]
     pub derived_outputs: BTreeMap<String, DerivedOutput>,
+    /// Versioned derived output, separate from the upstream core contract.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_extensions"
+    )]
+    pub extensions: Vec<shared::extensions::ExtensionEntry>,
 }
 
 /// Historical producers whose scripts may pass normal reuse eligibility.
@@ -1301,6 +1326,69 @@ pub(crate) fn retained_configuration_matches_for_reader(
     Ok(false)
 }
 
+/// As [`retained_configuration_matches_for_reader`], also accepting a reader identity that
+/// records an earlier base-schema digest the schema lineage trusts (`lineage`).
+///
+/// Substituting the compiled digest must give a reader identity this build still knows, so
+/// the adapter and diagnostics versions stay exactly checked. The recorded proof is then
+/// recomputed from the identity as the pack recorded it, with the earlier digest.
+pub(crate) fn retained_configuration_matches_for_lineage_reader(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+    recorded: &str,
+    identity: &serde_json::Value,
+    lineage: Option<&str>,
+) -> Result<bool> {
+    if retained_configuration_matches_for_reader(config, schema, recorded, identity)? {
+        return Ok(true);
+    }
+    let Some(earlier) = lineage else {
+        return Ok(false);
+    };
+    if config.record_reader != crate::config::RecordReader::Inhouse
+        || identity
+            .get("schema_sha256")
+            .and_then(|digest| digest.as_str())
+            != Some(earlier)
+    {
+        return Ok(false);
+    }
+    let mut normalized = identity.clone();
+    normalized["schema_sha256"] = serde_json::json!(hash_bytes(crate::records::SCHEMA_BYTES));
+    let schemas = config.schemas()?;
+    let known = normalized == crate::esm::inhouse::configured_reader_identity(config)?
+        || [
+            inhouse_adapter10_reader_identity(schemas.as_ref()),
+            inhouse_adapter11_reader_identity(schemas.as_ref()),
+            inhouse_adapter12_reader_identity(schemas.as_ref(), &config.language),
+        ]
+        .iter()
+        .any(|prior| prior.as_ref() == Some(&normalized));
+    Ok(known && recorded == configuration_hash_with_identity(config, schema, Some(identity))?)
+}
+
+/// The script ABI a recorded combined settings proof was made with, when exactly one ABI up
+/// to the configured one reproduces it. Every other setting must already match, so a proof
+/// that differs in anything besides the ABI finds none. The newest ABI is tried first.
+pub(crate) fn recover_script_abi(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+    recorded: &str,
+    identity: &serde_json::Value,
+    lineage: Option<&str>,
+) -> Result<Option<u32>> {
+    for abi in (1..=config.script_abi_version).rev() {
+        let mut candidate = config.clone();
+        candidate.script_abi_version = abi;
+        if retained_configuration_matches_for_lineage_reader(
+            &candidate, schema, recorded, identity, lineage,
+        )? {
+            return Ok(Some(abi));
+        }
+    }
+    Ok(None)
+}
+
 pub fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -1310,6 +1398,23 @@ pub fn hash_file(path: &Path) -> Result<String> {
     let file = fs::File::open(path)
         .wrap_err_with(|| format!("failed to open {} for hashing", path.display()))?;
     hash_open_file(&file).wrap_err_with(|| format!("failed to hash {}", path.display()))
+}
+
+/// Hashes `path`, or returns `None` when it does not exist.
+///
+/// A missing file is a normal state on a resumed run. Any other failure, such as a permission
+/// error or an I/O error, is returned with the path, so a caller cannot mistake an unreadable
+/// file for a changed one.
+pub fn hash_file_if_present(path: &Path) -> Result<Option<String>> {
+    match fs::File::open(path) {
+        Ok(file) => hash_open_file(&file)
+            .map(Some)
+            .wrap_err_with(|| format!("failed to hash {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).wrap_err_with(|| format!("failed to open {} for hashing", path.display()))
+        }
+    }
 }
 
 fn hash_open_file(mut file: &fs::File) -> std::io::Result<String> {
@@ -1334,6 +1439,53 @@ fn hash_open_file(mut file: &fs::File) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_capability_parse_is_tolerant_per_entry() {
+        let good = shared::extensions::ExtensionEntry {
+            id: "example.valid".into(),
+            version: 1,
+            owns: Default::default(),
+            sha256: String::new(),
+            built_from: "core".into(),
+            stats: Default::default(),
+        };
+        let mut document = serde_json::to_value(ConversionManifest::default()).unwrap();
+        document["extensions"] = serde_json::json!([
+            {"id": "example.missing_fields"},
+            {"id": "example.float_stat", "version": 1, "sha256": "", "built_from": "core", "stats": {"rows": 1.5}},
+            good,
+        ]);
+        let manifest: ConversionManifest = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(manifest.extensions, vec![good]);
+        document["extensions"] = serde_json::Value::Null;
+        let manifest: ConversionManifest = serde_json::from_value(document).unwrap();
+        assert!(manifest.extensions.is_empty());
+    }
+
+    #[test]
+    fn extensions_are_optional_and_round_trip_without_changing_core_fields() {
+        let mut manifest = ConversionManifest::default();
+        let before = serde_json::to_value(&manifest).unwrap();
+        assert!(before.get("extensions").is_none());
+        let legacy: ConversionManifest = serde_json::from_value(before.clone()).unwrap();
+        assert!(legacy.extensions.is_empty());
+        manifest
+            .extensions
+            .push(shared::extensions::ExtensionEntry {
+                id: "example.payload".to_owned(),
+                version: 1,
+                owns: shared::extensions::ExtensionOwns::default(),
+                sha256: "0".repeat(64),
+                built_from: "core".to_owned(),
+                stats: BTreeMap::new(),
+            });
+        let mut with_extension = serde_json::to_value(&manifest).unwrap();
+        let restored: ConversionManifest = serde_json::from_value(with_extension.clone()).unwrap();
+        assert_eq!(restored, manifest);
+        with_extension.as_object_mut().unwrap().remove("extensions");
+        assert_eq!(with_extension, before);
+    }
 
     /// Legacy absence and malformed optional records do not poison neighboring proofs.
     #[test]
@@ -1412,6 +1564,30 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// An absent file has no hash. An unreadable one is an error that names the path, not an
+    /// empty hash that looks like a changed file.
+    #[test]
+    fn hash_file_if_present_separates_absent_from_unreadable() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("output.glb");
+        assert_eq!(hash_file_if_present(&file).unwrap(), None);
+
+        fs::write(&file, b"bytes").unwrap();
+        assert_eq!(
+            hash_file_if_present(&file).unwrap(),
+            Some(hash_file(&file).unwrap())
+        );
+
+        // A directory cannot be read as a file on any platform.
+        let unreadable = directory.path().join("directory");
+        fs::create_dir(&unreadable).unwrap();
+        let error = hash_file_if_present(&unreadable).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("directory"),
+            "the error names the path: {error:#}"
+        );
     }
 
     #[test]
