@@ -51,6 +51,13 @@ export wrapper. This is an engineering policy: deeper modded assets are recorded
 models while the normal pipeline continues publishing usable neighbors. Block order and the
 collision block-to-glTF-node mapping are preserved throughout the accepted scene.
 
+**Drawable bounds.** A static `BSTriShape` can supply `meshes[i].extras.mudcrabDrawableSphere`.
+Its `center` is an array of three numbers in the same local coordinates as the exported vertex
+positions. Its `radius` is a positive number in the same units. The converter writes the
+source sphere when it is finite and encloses every position of the corresponding nonempty mesh.
+The engine transforms this bound for authored portal culling and uses the mesh box when the
+extra is absent. The model-level `mudcrabRoomSphere` separately determines room ownership.
+
 **Root transform.** A placed reference replaces its model root's local transform with its own, so
 the root block's authored translation, rotation and scale never apply in game. The static scene
 writes the root node (block 0) with an identity transform, and collision shapes start from an
@@ -277,6 +284,20 @@ block the primitive `mudcrabGeometryIndex` tag ([object materials](../engine/obj
 no Havok type derives from `NiAVObject`, so collision cannot change the scene's geometry count. Any
 other unparsed block type still refuses the tag. Mesh contract
 `object-texture-swap-geometry-index-v2` (#723) records this change; it changes the `nif` proof only.
+
+### 6.1 Non-finite UVs
+
+A few retail shapes store a NaN or infinite half-float UV in one vertex (the Whiterun guard house wall
+`WRGuardHouse01:48` has one in 1,095 vertices). The reader used to remove the whole `TEXCOORD_0`
+attribute for such a shape. Bevy 0.19 skips the base-colour sample of a mesh without UVs, so the
+surface drew its flat base colour.
+It now replaces each non-finite component with zero, keeps the attribute and logs the count.
+This is an engineering guard, not a retail rule: the retail look of the triangles around such a vertex
+was not traced (no row in the retail registry), and zero is only the neutral value. Whether retail
+treats such a vertex as a rule is unverified. Those triangles can show a stretched strip of texture;
+the rest of the mapping is intact.
+Mesh contract `non-finite-uv-repair-v1` records this change; it changes the `nif` proof only, so a
+normal conversion rebuilds meshes an earlier converter wrote. 21 meshes of the retail game change.
 
 ## 7. Skinning support boundary
 

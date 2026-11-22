@@ -7,8 +7,8 @@ use super::{
     ArchiveSelection, ExtractOptions, ExtractedFile, ExtractionOutcome, ExtractionProgressCallback,
     ExtractionTimings, FreshIngestion, IngestionSync, Interrupted, ProgressReporter,
     RawIngestionSession, RawWriteMeasurements, StopCheck, SyncMeasurements, archive_reader_version,
-    ba2, blob_path, bsa, check_stop, detect_archive_collision, restore_cached_files_with_io_limit,
-    safe_relative_path,
+    ba2, blob_path, bsa, check_stop, detect_archive_collision, ingestion_relative_path,
+    restore_cached_files_with_io_limit,
 };
 use crate::cache::{
     IngestedFile, IngestionCacheEntry, SpillCache, hash_bytes, hash_file, is_zero, link_or_copy,
@@ -160,7 +160,7 @@ impl Prepared {
     }
 }
 
-struct ByteBudget {
+pub(super) struct ByteBudget {
     limit: usize,
     used: Mutex<usize>,
     ready: Condvar,
@@ -168,9 +168,19 @@ struct ByteBudget {
 }
 
 impl ByteBudget {
-    fn reserve(self: &Arc<Self>, bytes: usize) -> Result<BudgetPermit> {
+    pub(super) fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            used: Mutex::new(0),
+            ready: Condvar::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    pub(super) fn reserve(self: &Arc<Self>, bytes: usize) -> Result<BudgetPermit> {
+        let bytes = bytes.clamp(1, self.limit);
         let mut used = self.used.lock().unwrap();
-        while *used + bytes > self.limit {
+        while bytes > self.limit - *used {
             if self.closed.load(Ordering::Acquire) {
                 return Err(WriterQueueStopped.into());
             }
@@ -194,7 +204,7 @@ impl ByteBudget {
     }
 }
 
-struct BudgetPermit {
+pub(super) struct BudgetPermit {
     budget: Arc<ByteBudget>,
     bytes: usize,
 }
@@ -255,9 +265,11 @@ pub(super) fn extract(
         stop,
         observer,
         &session,
+        &mut BTreeMap::new(),
     )
 }
 
+/// Inventory source paths once, count recipe exclusions and recover durable selected batches.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn extract_with_session(
     archive_path: &Path,
@@ -270,6 +282,7 @@ pub(super) fn extract_with_session(
     stop: Option<StopCheck<'_>>,
     observer: WriterObserver<'_>,
     session: &RawIngestionSession,
+    ignored_inputs_by_extension: &mut BTreeMap<String, u64>,
 ) -> Result<ExtractionOutcome> {
     ensure!(
         options.cpu_jobs > 0 && options.io_jobs > 0,
@@ -296,25 +309,40 @@ pub(super) fn extract_with_session(
             .collect(),
         Some(b"BTDX") => ba2::iter_raw_entries(&bytes)?
             .into_iter()
-            .map(|entry| (entry.name.clone(), Payload::Ba2(entry)))
+            .map(|entry| (entry.entry.name.clone(), Payload::Ba2(entry)))
             .collect(),
         _ => bail!("unsupported archive magic in {}", archive_path.display()),
     };
     let mut seen = BTreeMap::new();
-    let mut selected = Vec::new();
+    let mut chosen = Vec::new();
+    let mut inventory = BTreeMap::new();
     for (name, payload) in raw {
-        let path = safe_relative_path(&name)?;
-        // Validate the whole namespace before filtering: unsupported files do
+        let authoring = crate::asset_path::is_authoring_source_name(&name);
+        if authoring && options.selection != ArchiveSelection::All {
+            continue;
+        }
+        let path = super::normalize_archive_path(&name, authoring)?;
+        // Validate the runtime namespace before filtering: unsupported files do
         // not conceal traversal or case-folded collisions.
         detect_archive_collision(&mut seen, &path, &name)?;
         if options.selection.includes(&path) {
-            let bytes = payload.decoded_size()?;
-            selected.push(Pending {
-                path,
-                bytes,
-                payload,
-            });
+            chosen.push((path, payload));
+        } else if !crate::controls::owns_input(&path) {
+            crate::input_inventory::record_ignored(&mut inventory, &path);
         }
+    }
+    // Hand the completed directory inventory to the caller before payloads are
+    // decoded, so a recoverable payload error keeps these counts. A directory
+    // validation error returns without publishing partial counts.
+    *ignored_inputs_by_extension = inventory;
+    let mut selected = Vec::new();
+    for (path, payload) in chosen {
+        let bytes = payload.decoded_size()?;
+        selected.push(Pending {
+            path,
+            bytes,
+            payload,
+        });
     }
     let total_bytes = selected.iter().map(|entry| entry.bytes as u64).sum();
     let reporter = progress
@@ -345,7 +373,7 @@ pub(super) fn extract_with_session(
     });
     if let Some(previous) = reusable {
         for file in &previous.files {
-            let path = safe_relative_path(&file.path)?;
+            let path = ingestion_relative_path(&file.path)?;
             if options.selection.includes(&path) {
                 ensure!(
                     expected.insert(path, file).is_none(),
@@ -358,6 +386,9 @@ pub(super) fn extract_with_session(
     // Missing/corrupt derived blobs fall through to reconstruction from packs.
     if observer.is_none()
         && expected.len() == selected.len()
+        && selected
+            .iter()
+            .all(|entry| expected.contains_key(&entry.path))
         && reusable.is_some()
         && expected.iter().all(|(path, file)| {
             packed.get(path).is_some_and(|packed| {
@@ -434,12 +465,7 @@ pub(super) fn extract_with_session(
         .unwrap_or(0);
     // Oversize textures use a single batch, still bounded by the 1 GiB entry
     // limit. Ordinary batches share a 64 MiB decoded-byte budget.
-    let budget = Arc::new(ByteBudget {
-        limit: QUEUED_BYTES.max(largest),
-        used: Mutex::new(0),
-        ready: Condvar::new(),
-        closed: AtomicBool::new(false),
-    });
+    let budget = Arc::new(ByteBudget::new(QUEUED_BYTES.max(largest)));
     let cpu_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.cpu_jobs)
         .build()?;
@@ -826,7 +852,7 @@ fn pack_directory(cache: &Path, source_hash: &str, recipe: &str) -> Result<PathB
     ensure!(
         matches!(
             recipe,
-            "all-v1" | "converter-inputs-v4" | "runtime-english-v4"
+            "all-v1" | "all-v2" | "converter-inputs-v4" | "runtime-english-v4"
         ),
         "unknown ingestion recipe"
     );
@@ -1022,7 +1048,7 @@ fn validate_pack_layout(
     let mut payloads = BTreeMap::new();
     let mut layout = Vec::with_capacity(index.files.len());
     for item in &index.files {
-        let relative = safe_relative_path(&item.path)?;
+        let relative = ingestion_relative_path(&item.path)?;
         detect_archive_collision(&mut seen, &relative, &item.path)?;
         ensure!(
             item.size <= MAX_FILE_BYTES as u64,
@@ -1161,6 +1187,7 @@ pub(crate) fn prune_stale_reader_packs(
             "converter-inputs-v2",
             "runtime-english-v1",
             "converter-inputs-v1",
+            "all-v1",
             ArchiveSelection::All.recipe(),
         ] {
             let recipe_dir = source_dir.join(recipe);
@@ -1249,6 +1276,7 @@ fn restore_pack_inventory(
             selection.recipe(),
             ArchiveSelection::ConverterInputsV1.recipe(),
             ArchiveSelection::All.recipe(),
+            "all-v1",
         ]) {
             if !selection.accepts_recipe(recipe) {
                 continue;
@@ -1471,6 +1499,35 @@ mod tests {
             fs::read(output.join("meshes/actors/character/animations/mt_idle.hkx")).unwrap(),
             b"clip"
         );
+    }
+
+    #[test]
+    fn filtered_archive_overlay_ignores_encoded_authoring_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("vfs");
+        let cache = dir.path().join("cache");
+        let path = "meshes/test.nif";
+        let options = ExtractOptions {
+            selection: ArchiveSelection::ConverterInputsV1,
+            ..options()
+        };
+        for (name, source, payload, expected) in [
+            ("initial.bsa", path, "first", "first"),
+            (
+                "authoring.bsa",
+                "%43alienteTools/Meshes/Test.NIF",
+                "author",
+                "first",
+            ),
+            ("winner.bsa", path, "last", "last"),
+        ] {
+            let archive = fixture(dir.path(), name, &[(source, payload.as_bytes())]);
+            extract(
+                &archive, &output, &cache, &cache, None, &options, None, None, None,
+            )
+            .unwrap();
+            assert_eq!(fs::read(output.join(path)).unwrap(), expected.as_bytes());
+        }
     }
 
     #[test]
@@ -2539,13 +2596,22 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_reservation_uses_the_entire_budget_and_releases_it() {
+        let budget = Arc::new(ByteBudget::new(8));
+        let permit = budget.reserve(usize::MAX).unwrap();
+        assert_eq!(*budget.used.lock().unwrap(), budget.limit);
+        drop(permit);
+
+        let first = budget.reserve(4).unwrap();
+        let second = budget.reserve(4).unwrap();
+        assert_eq!(*budget.used.lock().unwrap(), budget.limit);
+        drop((first, second));
+        assert_eq!(*budget.used.lock().unwrap(), 0);
+    }
+
+    #[test]
     fn writer_failure_wakes_byte_budget_waiters_without_dropping_existing_reservations() {
-        let budget = Arc::new(ByteBudget {
-            limit: 1,
-            used: Mutex::new(0),
-            ready: Condvar::new(),
-            closed: AtomicBool::new(false),
-        });
+        let budget = Arc::new(ByteBudget::new(1));
         let permit = budget.reserve(1).unwrap();
         let (sent, received) = std::sync::mpsc::channel();
         let waiting = Arc::clone(&budget);
@@ -2912,7 +2978,7 @@ mod tests {
             .take(2048)
             .map(|entry| {
                 (
-                    safe_relative_path(&entry.name)
+                    ingestion_relative_path(&entry.name)
                         .unwrap()
                         .to_string_lossy()
                         .into_owned(),
@@ -3031,7 +3097,7 @@ mod tests {
             "sample_entries": sample.len(),
             "sample_decoded_bytes": sample.iter().map(|(_, data)| data.len()).sum::<usize>(),
             "cpu_jobs": options.cpu_jobs, "io_jobs": options.io_jobs,
-            "selection": "all-v1", "checkpoint_markers": false,
+            "selection": ArchiveSelection::All.recipe(), "checkpoint_markers": false,
             "wall_seconds": { "legacy_per_file_sync": legacy_seconds,
                 "durable_batches_cold": batch_seconds, "durable_batches_warm": warm_seconds,
                 "corrupted_blob_restore": repair_seconds },

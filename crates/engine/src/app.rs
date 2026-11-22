@@ -705,8 +705,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
 /// Process exit code for a run that ended because the GPU device was lost.
 ///
 /// Distinct from 1 (any other failed run) and 2 (an unusable command line), so a benchmark or
-/// acceptance script can record a lost device apart from other failures. It does not clear the
-/// engine: a GPU fault or a command buffer the driver times out also loses the device.
+/// acceptance script can record a lost device apart from other failures. The run exits with this
+/// code only when Bevy reports `ErrorType::DeviceLost`. A failed Metal command buffer does not lose
+/// the device on wgpu 29: the device stays alive and the engine does not notice the failure, so
+/// this code does not cover it.
 pub const EXIT_DEVICE_LOST: u8 = 3;
 
 /// The run ended because the GPU device was lost.
@@ -2625,6 +2627,7 @@ fn setup_world(
         Projection::Perspective(perspective),
         camera_transform,
         StreamingCamera,
+        crate::room_culling::RoomCullingNear::SKYRIM,
         IsDefaultUiCamera,
         // This camera draws the streamed world, so the weather's distance fog covers it.
         FogCamera,
@@ -2688,6 +2691,12 @@ fn setup_world(
         target = ?target,
         "Mudcrab runtime initialized"
     );
+}
+
+#[cfg(test)]
+pub(crate) fn add_test_world_camera(app: &mut App) {
+    app.insert_resource(EngineConfig::default())
+        .add_systems(Startup, setup_world);
 }
 
 fn initial_camera_ground_height(

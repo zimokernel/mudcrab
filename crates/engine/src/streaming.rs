@@ -1927,11 +1927,16 @@ fn spawn_cell(
             if let Some(bounds) = bounds.zip(model_bounds) {
                 entity.insert(bounds);
             }
-            // Authored multibound policies and movable references override stored room membership.
-            if reference.has_multibound_override
-                || crate::room_culling::exempt_record_type(reference.base_record_type.as_deref())
-            {
-                entity.insert(crate::room_culling::RoomCullExempt);
+            crate::room_culling::mark_reference_exemptions(
+                &mut entity,
+                reference.base_record_type.as_deref(),
+                reference.has_multibound_override,
+            );
+            if reference.named_room_target {
+                entity.insert(crate::room_culling::NamedRoomAssignment::Initial {
+                    root,
+                    placement: transform.compute_affine(),
+                });
             }
             if let Some(plan) = &actor_plan {
                 entity.insert(plan.actor);
@@ -4719,41 +4724,7 @@ fn spawned_model_path(model_path: Option<String>, base_is_marker: bool) -> Optio
 }
 
 pub(crate) fn converted_model_path(path: String) -> Option<String> {
-    // Converted assets are published with lowercase canonical paths, so the
-    // lookup must lowercase too (matching world-inspect's resolver).
-    // The filename is no marker signal: forges and the Civil War map flags carry
-    // "marker" and must draw. Editor markers are excluded by the base record's
-    // `Is Marker` flag (`spawned_model_path`) and, inside a mesh, by the converter's
-    // `EditorMarker` shape rule; the folder rules below stay as path-convention guards.
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    if normalized.starts_with("meshes/sky/")
-        || normalized.starts_with("sky/")
-        || normalized.starts_with("meshes/markers/")
-        || normalized.starts_with("markers/")
-        || normalized.starts_with("meshes/effects/")
-        || normalized.starts_with("effects/")
-    {
-        return None;
-    }
-    let without_prefix = normalized.strip_prefix("meshes/").unwrap_or(&normalized);
-    if without_prefix.is_empty() || !is_safe_relative_asset_path(without_prefix) {
-        return None;
-    }
-    let mut converted = std::path::PathBuf::from("meshes").join(without_prefix);
-    converted.set_extension("glb");
-    Some(converted.to_string_lossy().replace('\\', "/"))
-}
-
-/// Rejects a database-supplied relative path that could escape the assets
-/// root once re-rooted under `meshes/` with `PathBuf::join`. A `..` segment
-/// walks back out of the base directory, and a rooted or drive-prefixed path
-/// makes `PathBuf::join` replace the base entirely instead of appending to it
-/// (see the `std::path::PathBuf::push` docs). Every component must therefore
-/// be a plain, non-empty path segment.
-fn is_safe_relative_asset_path(path: &str) -> bool {
-    std::path::Path::new(path)
-        .components()
-        .all(|component| matches!(component, std::path::Component::Normal(_)))
+    shared::world_assets::streamed_model_path(&path)
 }
 
 /// Orders stored layers, supplying the configured implicit base for an unpainted quadrant.
@@ -7027,7 +6998,25 @@ mod tests {
             converted_model_path("Markers/CivilWarMarkers/CWAttSpawn02.nif".into()),
             None
         );
-        assert_eq!(converted_model_path("Effects/FXRapids.nif".into()), None);
+        for path in [
+            r"Effects\FXcobwebRoundWall01.nif",
+            "Effects/./FXcobwebRoundWall01.nif",
+            "./Meshes/Effects/./FXcobwebRoundWall01.nif",
+            "meshes/effects/fxcobwebroundwall01.nif",
+        ] {
+            assert_eq!(
+                spawned_model_path(Some(path.into()), false).as_deref(),
+                Some("meshes/effects/fxcobwebroundwall01.glb")
+            );
+            assert!(spawned_model_path(Some(path.into()), true).is_none());
+        }
+        for path in [
+            "Effects/FXRapids.nif",
+            "Effects/./FXRapids.nif",
+            "Effects/../Effects/FXcobwebRoundWall01.nif",
+        ] {
+            assert_eq!(converted_model_path(path.into()), None);
+        }
     }
 
     #[test]
@@ -9397,6 +9386,7 @@ mod tests {
                     form_id: 0x00F9907,
                     initially_enabled: true,
                     has_multibound_override: false,
+                    named_room_target: false,
                     starts_dead: false,
                     cell_id: 0x02D4E0,
                     base_form_id: 0x00EF957,
@@ -10441,6 +10431,7 @@ mod tests {
             form_id,
             initially_enabled: true,
             has_multibound_override: false,
+            named_room_target: false,
             starts_dead: false,
             cell_id: 99,
             base_form_id: 0x200 + form_id,
@@ -11427,7 +11418,10 @@ mod tests {
                     Vec3::new(1.0, 1.0, 10.0),
                     Vec3::new(-1.0, 1.0, 10.0),
                 ],
-                rooms: [Some(0), Some(1)],
+                rooms: [
+                    crate::room_culling::PortalSide::Room(0),
+                    crate::room_culling::PortalSide::Room(1),
+                ],
             }],
             membership: [1, 2, 3]
                 .into_iter()
@@ -11466,6 +11460,38 @@ mod tests {
             &vec![meshes[0], meshes[2]],
             "NONE and unknown bounds stay visible while the bounded automatic static is culled"
         );
+    }
+
+    #[test]
+    fn only_named_room_targets_track_the_streamed_placement() {
+        use crate::room_culling::{NamedRoomAssignment, RoomCullExempt, RoomCullLegacyExempt};
+
+        let mut named = lit_reference(1, None, None);
+        named.base_record_type = Some("ACTI".to_owned());
+        named.named_room_target = true;
+        let mut unrestricted = lit_reference(2, None, None);
+        unrestricted.has_multibound_override = true;
+        let automatic = lit_reference(3, None, None);
+        let app = spawn_reference_cell_app(vec![named, unrestricted, automatic], false);
+        let world = app.world();
+        let reference = reference_entity(&app, 1);
+        assert!(world.get::<RoomCullLegacyExempt>(reference).is_some());
+        assert!(world.get::<RoomCullExempt>(reference).is_none());
+        let Some(NamedRoomAssignment::Initial { root, placement }) = world.get(reference) else {
+            panic!("streamed named target did not retain its original placement");
+        };
+        assert_eq!(*root, world.resource::<SpawnedCellRoot>().0.unwrap());
+        assert_eq!(
+            *placement,
+            world.get::<Transform>(reference).unwrap().compute_affine()
+        );
+        for id in [2, 3] {
+            assert!(
+                world
+                    .get::<NamedRoomAssignment>(reference_entity(&app, id))
+                    .is_none()
+            );
+        }
     }
 
     #[test]
