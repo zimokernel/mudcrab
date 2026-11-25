@@ -6,7 +6,8 @@
 //!
 //! - bevyengine/bevy#26504: the morph descriptor is pending until its mesh is ready;
 //! - bevyengine/bevy#26095: stale GPU bin-unpacking jobs and bind groups are cleared every frame;
-//! - bevyengine/bevy#26588: the GPU clustering staging-buffer leak.
+//! - bevyengine/bevy#26588: the GPU clustering staging-buffer leak;
+//! - Mudcrab's retail point-light falloff (`RetailPointFalloff`, #955), `1 - saturate(d / r)^2`.
 //!
 //! Code checks run on source with whole-line `//` comments removed and whitespace collapsed, so
 //! code turned into a comment, or re-wrapped by `rustfmt`, is judged by what it really does. Marker
@@ -19,11 +20,13 @@ const PBR_MORPH: &str = "src/render/morph.rs";
 const PBR_MESH: &str = "src/render/mesh.rs";
 const PBR_PREPROCESS: &str = "src/render/gpu_preprocess.rs";
 const PBR_CLUSTER: &str = "src/cluster/gpu.rs";
+const PBR_LIGHT: &str = "src/render/light.rs";
 const RENDER_PREPROCESSING: &str = "src/batching/gpu_preprocessing.rs";
 
 const MARKER_26504: &str = "mudcrab: bevyengine/bevy#26504";
 const MARKER_26095: &str = "mudcrab: bevyengine/bevy#26095";
 const MARKER_26588: &str = "mudcrab: bevyengine/bevy#26588";
+const MARKER_POWER_RAMP: &str = "mudcrab: ";
 
 fn vendor(crate_name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -191,6 +194,61 @@ fn check_patches(pbr: &Path, render: &Path) {
         "{PBR_CLUSTER} has the write-only metadata_staging_pending_buffers list again \
          (bevy#26588): GPU clustering leaks a buffer handle per view per frame"
     );
+
+    // Mudcrab's own fog falloff, not a Bevy change (#891): the weather's exterior fog is drawn by
+    // `FogFalloff::PowerRamp`. Without it the engine's fog would not build, or would draw nothing.
+    for (file, needed) in [
+        ("src/fog.rs", "PowerRamp {"),
+        ("src/render/fog.rs", "GPU_FOG_MODE_POWER_RAMP"),
+        ("src/render/mesh_view_types.wgsl", "FOG_MODE_POWER_RAMP"),
+        ("src/render/fog.wgsl", "fn power_ramp_fog("),
+        ("src/render/pbr_functions.wgsl", "power_ramp_fog("),
+    ] {
+        let source = required_source(pbr, file);
+        assert!(
+            source.contains(MARKER_POWER_RAMP) && code(&source).contains(needed),
+            "{file} lost the power ramp fog (`{needed}` or its `{MARKER_POWER_RAMP}` marker)"
+        );
+    }
+    assert!(
+        code(&required_source(pbr, "src/render/fog.wgsl"))
+            .contains("min(exp2(log2(s) * power), far_color.a)"),
+        "the power ramp fog shader no longer computes min(s^power, max)"
+    );
+
+    // Mudcrab's retail point-light falloff (#955), not a Bevy change: a light with the
+    // `RetailPointFalloff` marker gets the flag, and the shader uses `1 - saturate(d / r)^2` for
+    // it. Without any link of this chain every Skyrim light falls back to Bevy's inverse square,
+    // at lumens sized for the retail curve, which is thousands of times too bright up close.
+    let light = required_source(pbr, PBR_LIGHT);
+    let light_code = code(&light);
+    for needed in [
+        "pub struct RetailPointFalloff;",
+        "Has<RetailPointFalloff>,",
+        "retail_falloff,",
+        "flags |= PointLightFlags::RETAIL_FALLOFF;",
+        "const RETAIL_FALLOFF = 1 << 6;",
+    ] {
+        assert!(
+            light_code.contains(needed),
+            "{PBR_LIGHT} lost `{needed}` (retail point-light falloff)"
+        );
+    }
+    assert!(
+        code(&required_source(pbr, "src/render/mesh_view_types.wgsl"))
+            .contains("POINT_LIGHT_FLAGS_RETAIL_FALLOFF_BIT: u32 = 1u << 6u;"),
+        "mesh_view_types.wgsl lost the retail falloff flag bit"
+    );
+    let lighting = code(&required_source(pbr, "src/render/pbr_lighting.wgsl"));
+    for needed in [
+        "return saturate(1.0 - distanceSquare * inverseRangeSquared);",
+        "if ((*light).flags & POINT_LIGHT_FLAGS_RETAIL_FALLOFF_BIT) != 0u { rangeAttenuation = getRetailDistanceAttenuation(",
+    ] {
+        assert!(
+            lighting.contains(needed),
+            "pbr_lighting.wgsl lost `{needed}` (retail point-light falloff)"
+        );
+    }
 }
 
 #[test]
@@ -277,6 +335,13 @@ fn vendored_copy_with_endings(
         ("bevy_pbr", PBR_MESH),
         ("bevy_pbr", PBR_PREPROCESS),
         ("bevy_pbr", PBR_CLUSTER),
+        ("bevy_pbr", "src/fog.rs"),
+        ("bevy_pbr", "src/render/fog.rs"),
+        ("bevy_pbr", "src/render/mesh_view_types.wgsl"),
+        ("bevy_pbr", "src/render/fog.wgsl"),
+        ("bevy_pbr", "src/render/pbr_functions.wgsl"),
+        ("bevy_pbr", PBR_LIGHT),
+        ("bevy_pbr", "src/render/pbr_lighting.wgsl"),
         ("bevy_render", RENDER_PREPROCESSING),
     ] {
         let destination = copy.path().join(crate_name).join(relative);
@@ -293,6 +358,41 @@ fn check_copy(copy: &tempfile::TempDir) {
         &copy.path().join("bevy_pbr"),
         &copy.path().join("bevy_render"),
     );
+}
+
+#[test]
+#[should_panic(expected = "lost the power ramp fog")]
+fn dropping_the_power_ramp_shader_branch_fails() {
+    check_copy(&vendored_copy("src/render/pbr_functions.wgsl", |text| {
+        text.replace("power_ramp_fog(", "linear_fog(")
+    }));
+}
+
+#[test]
+#[should_panic(expected = "no longer computes")]
+fn changing_the_power_ramp_formula_fails() {
+    check_copy(&vendored_copy("src/render/fog.wgsl", |text| {
+        text.replace("exp2(log2(s) * power)", "s")
+    }));
+}
+
+#[test]
+#[should_panic(expected = "retail point-light falloff")]
+fn dropping_the_retail_falloff_shader_branch_fails() {
+    check_copy(&vendored_copy("src/render/pbr_lighting.wgsl", |text| {
+        text.replace(
+            "getRetailDistanceAttenuation(distance_square",
+            "getDistanceAttenuation(distance_square",
+        )
+    }));
+}
+
+#[test]
+#[should_panic(expected = "retail point-light falloff")]
+fn dropping_the_retail_falloff_flag_fails() {
+    check_copy(&vendored_copy(PBR_LIGHT, |text| {
+        text.replace("flags |= PointLightFlags::RETAIL_FALLOFF;", "")
+    }));
 }
 
 #[test]

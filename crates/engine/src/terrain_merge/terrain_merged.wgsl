@@ -1,3 +1,6 @@
+#import engine::terrain_blend::{NearTerrainBlendSettings, noisy_land_colour, terrain_atlas_uv, terrain_blend_ramp, terrain_blend_weight}
+#import engine::terrain_normal::{terrain_tangent_normal, terrain_tbn}
+
 // The shared terrain shader of merged cells (#215): one material for every cell.
 //
 // Each vertex carries its quadrant's land texture ids and its own slot weights (see
@@ -92,10 +95,6 @@ struct MergedTerrainSettings {
 @group(#{MATERIAL_BIND_GROUP}) @binding(119) var<storage, read> land_entries: array<vec2<u32>>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(120) var<uniform> settings: MergedTerrainSettings;
 
-// Skyrim's `_n` maps are DirectX-convention: green points down the texture, so it is flipped to the
-// tangent frame's +Y. The same constant as `terrain.wgsl`.
-const NORMAL_GREEN_SIGN: f32 = -1.0;
-
 struct TerrainVertex {
     @builtin(instance_index) instance_index: u32,
     @location(0) position: vec3<f32>,
@@ -117,6 +116,12 @@ struct TerrainVertex {
     @location(15) weights_3: vec4<f32>,
 #endif
 }
+
+@group(#{MATERIAL_BIND_GROUP}) @binding(121) var<uniform> seam: NearTerrainBlendSettings;
+@group(#{MATERIAL_BIND_GROUP}) @binding(122) var seam_overlay: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(123) var seam_overlay_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(124) var seam_noise: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(125) var seam_noise_sampler: sampler;
 
 struct TerrainVertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -145,6 +150,7 @@ struct TerrainVertexOutput {
     @location(14) weights_2: vec4<f32>,
     @location(15) weights_3: vec4<f32>,
 #endif
+    @location(3) seam_ramp: f32,
 }
 
 @vertex
@@ -175,6 +181,7 @@ fn vertex(input: TerrainVertex) -> TerrainVertexOutput {
     out.weights_2 = input.weights_2;
     out.weights_3 = input.weights_3;
 #endif
+    out.seam_ramp = terrain_blend_ramp(distance(vec2<f32>(input.position.x, -input.position.z), seam.centre.xy));
     return out;
 }
 
@@ -249,14 +256,6 @@ fn sample_normal(class_slot: u32, uv: vec2<f32>, layer: u32, ddx: vec2<f32>, ddy
 #else
     return vec4<f32>(0.5, 0.5, 1.0, 0.0);
 #endif
-}
-
-// The terrain's tangent frame, the same analytic one as `terrain.wgsl`: texture coordinates run
-// along world +X (u) and world -Z (v).
-fn terrain_tbn(n: vec3<f32>) -> mat3x3<f32> {
-    let u_axis = vec3<f32>(1.0, 0.0, 0.0);
-    let t = normalize(u_axis - n * dot(n, u_axis) + vec3<f32>(0.0, 0.0, 1.0e-6));
-    return mat3x3<f32>(t, cross(n, t), n);
 }
 
 // Same PBR bridge as terrain.wgsl: normal alpha is Skyrim's specular intensity, not roughness.
@@ -345,9 +344,7 @@ fn fragment(in: TerrainVertexOutput) -> FragmentOutput {
 #ifdef TERRAIN_HAS_NORMAL_CLASSES
         if entry.y != NO_NORMAL_WORD {
             let sample = sample_normal(entry.y >> 16u, uv, entry.y & 0xFFFFu, ddx, ddy);
-            let xy = sample.xy * 2.0 - 1.0;
-            let tilt = vec2<f32>(xy.x, NORMAL_GREEN_SIGN * xy.y);
-            tangent_normal += vec3<f32>(tilt, sqrt(max(0.0, 1.0 - dot(tilt, tilt)))) * weight;
+            tangent_normal += terrain_tangent_normal(sample.xy) * weight;
             specular_mask += sample.a * weight;
             any_normal = true;
         } else {
@@ -357,12 +354,27 @@ fn fragment(in: TerrainVertexOutput) -> FragmentOutput {
         tangent_normal += vec3<f32>(0.0, 0.0, 1.0) * weight;
 #endif
     }
-    pbr_input.material.base_color *= color / total;
+    color = color / total;
+    let seam_weight = terrain_blend_weight(in.seam_ramp, seam.atlas.w);
+    if seam.atlas.w != 0.0 {
+        let distant_uv = terrain_atlas_uv(in.uv, seam.atlas);
+        let distant = textureSample(seam_overlay, seam_overlay_sampler, distant_uv).rgb;
+        let noisy = noisy_land_colour(distant, seam_noise, seam_noise_sampler, distant_uv);
+        color = vec4<f32>(mix(color.rgb, noisy, seam_weight), color.a);
+    }
+    // Technique 19 order (skyrim_decomp#979): noise scales the distant sample before blending.
+    // Vertex tint scales the full lit diffuse before the first fog bound. Highlights enter
+    // separately before a second bound when enabled.
+    // Bevy's vertex color scales the blended base color before diffuse lighting. The specular
+    // reflectance of these opaque dielectric materials is independent of base color.
+    // Bevy fog processes the combined lit result. The separate fog bounds need draw inputs
+    // that this pass does not bind.
+    pbr_input.material.base_color *= color;
     pbr_input.material.reflectance = terrain_reflectance(pbr_input.material.reflectance, specular_mask, total);
     // Only a fragment that reads at least one normal map turns the blend into a world normal.
     if any_normal {
         let geometric = normalize(pbr_input.world_normal);
-        pbr_input.N = normalize(terrain_tbn(geometric) * normalize(tangent_normal));
+        pbr_input.N = normalize(terrain_tbn(geometric) * normalize(mix(tangent_normal / total, vec3<f32>(0.0, 0.0, 1.0), seam_weight)));
     }
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
     var out: FragmentOutput;

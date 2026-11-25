@@ -5,6 +5,7 @@
 //! limit the loss of culling granularity; batches never cross a chunk, material, or render state.
 
 use super::{TerrainCoverage, TerrainSurfaceReady};
+use crate::terrain_lod_noise::NoisyTerrainLodMaterial;
 use crate::terrain_upload::TerrainMeshUploadReadiness;
 use crate::visibility_optimization::StructuralHierarchyNode;
 use bevy::{
@@ -43,6 +44,12 @@ const BATCH_SIDE_CELLS: i32 = 2;
 /// A render mesh representing at most sixteen source quadrants in a two-by-two-cell tile.
 #[derive(Component)]
 pub(crate) struct LodTerrainBatch;
+
+/// A render mesh this module spawned for LOD terrain: a batch, or the fallback quadrant drawn
+/// while a batch uploads. The land shadow policy (`super::apply_land_shadow_policy`) finds terrain
+/// through it, since these meshes carry no coverage component.
+#[derive(Component)]
+pub(crate) struct LandMesh;
 
 #[derive(Component)]
 pub(crate) struct PendingLodTerrainBatching {
@@ -110,8 +117,14 @@ struct BatchMember {
 }
 
 #[derive(Clone, PartialEq)]
+enum TerrainMaterialHandle {
+    Standard(Handle<StandardMaterial>),
+    Noisy(Handle<NoisyTerrainLodMaterial>),
+}
+
+#[derive(Clone, PartialEq)]
 struct RenderState {
-    material: Handle<StandardMaterial>,
+    material: TerrainMaterialHandle,
     transform: Transform,
     layers: Option<RenderLayers>,
     tag: Option<u32>,
@@ -130,7 +143,8 @@ pub(super) struct PreparedBatch {
 }
 
 type PrimitiveRenderState = (
-    &'static MeshMaterial3d<StandardMaterial>,
+    Option<&'static MeshMaterial3d<StandardMaterial>>,
+    Option<&'static MeshMaterial3d<NoisyTerrainLodMaterial>>,
     Option<&'static RenderLayers>,
     Option<&'static MeshTag>,
     Has<NotShadowCaster>,
@@ -182,6 +196,7 @@ pub(crate) struct LodBatchPreparation<'w, 's> {
     unsupported: Query<'w, 's, Entity, UnsupportedNode>,
     culling: Query<'w, 's, PrimitiveCullingState>,
     materials: Res<'w, Assets<StandardMaterial>>,
+    noisy_materials: Option<Res<'w, Assets<NoisyTerrainLodMaterial>>>,
     readiness: Option<Res<'w, TerrainMeshUploadReadiness>>,
 }
 
@@ -322,7 +337,8 @@ impl LodBatchPreparation<'_, '_> {
         let mut tiles = HashMap::<IVec2, Vec<usize>>::new();
         for (primitive, (source_patch, coverage, selected)) in ordered {
             let (
-                material,
+                standard,
+                noisy,
                 layers,
                 tag,
                 not_shadow_caster,
@@ -332,12 +348,22 @@ impl LodBatchPreparation<'_, '_> {
             ) = self
                 .render_states
                 .get(primitive)
-                .map_err(|_| "terrain primitive lacks a standard material")?;
-            if self
-                .materials
-                .get(&material.0)
-                .is_none_or(|material| material.alpha_mode != AlphaMode::Opaque)
-            {
+                .map_err(|_| "terrain primitive lacks render state")?;
+            let (material, base) = match (standard, noisy) {
+                (Some(handle), None) => (
+                    TerrainMaterialHandle::Standard(handle.0.clone()),
+                    self.materials.get(&handle.0),
+                ),
+                (None, Some(handle)) => (
+                    TerrainMaterialHandle::Noisy(handle.0.clone()),
+                    self.noisy_materials
+                        .as_ref()
+                        .and_then(|materials| materials.get(&handle.0))
+                        .map(|material| &material.base),
+                ),
+                _ => return Err("terrain primitive must have one material".into()),
+            };
+            if base.is_none_or(|material| material.alpha_mode != AlphaMode::Opaque) {
                 return Err("terrain material is missing or requires transparency ordering".into());
             }
             let source = meshes
@@ -358,7 +384,7 @@ impl LodBatchPreparation<'_, '_> {
                 return Err("terrain mesh has morph or skin data".into());
             }
             let state = RenderState {
-                material: material.0.clone(),
+                material,
                 transform: primitive_transforms[&primitive],
                 layers: layers.cloned(),
                 tag: tag.map(|tag| tag.0),
@@ -543,13 +569,17 @@ fn spawn_render_mesh(
     bounds: Option<Aabb>,
 ) -> Entity {
     let mut entity = commands.spawn((
+        LandMesh,
         NoAutoAabb,
         Mesh3d(mesh),
-        MeshMaterial3d(state.material.clone()),
         state.transform,
         visibility,
         ChildOf(root),
     ));
+    match &state.material {
+        TerrainMaterialHandle::Standard(handle) => entity.insert(MeshMaterial3d(handle.clone())),
+        TerrainMaterialHandle::Noisy(handle) => entity.insert(MeshMaterial3d(handle.clone())),
+    };
     if let Some(bounds) = bounds {
         entity.insert(bounds);
     }
@@ -1922,6 +1952,36 @@ mod tests {
     }
 
     #[test]
+    fn land_noise_material_survives_terrain_batching() {
+        use crate::terrain_lod_noise::LandNoise;
+
+        let mut app = test_app();
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        app.init_resource::<Assets<NoisyTerrainLodMaterial>>();
+        let noisy = app
+            .world_mut()
+            .resource_mut::<Assets<NoisyTerrainLodMaterial>>()
+            .add(NoisyTerrainLodMaterial {
+                base: StandardMaterial::default(),
+                extension: LandNoise {
+                    image: Handle::default(),
+                },
+            });
+        for &primitive in &fixture.primitives {
+            app.world_mut()
+                .entity_mut(primitive)
+                .remove::<MeshMaterial3d<StandardMaterial>>()
+                .insert(MeshMaterial3d(noisy.clone()));
+        }
+        let batches = prepare(&mut app, &fixture).expect("noise material can be batched");
+        assert_eq!(batches.len(), 1);
+        assert!(matches!(
+            &batches[0].state.material,
+            TerrainMaterialHandle::Noisy(handle) if handle == &noisy
+        ));
+    }
+
+    #[test]
     fn unsupported_scene_behavior_leaves_the_original_hierarchy_untouched() {
         let mut app = test_app();
         let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
@@ -2146,6 +2206,19 @@ mod tests {
             assert!(batch.fallback_entities.iter().all(|&fallback| {
                 *app.world().get::<Visibility>(fallback).unwrap() == Visibility::Inherited
             }));
+            // `spawn_render_mesh` tags the batch and every fallback, so the land shadow policy
+            // finds them whichever order the source flags arrived in.
+            for entity in batch
+                .fallback_entities
+                .iter()
+                .copied()
+                .chain([batch.entity])
+            {
+                assert!(
+                    app.world().entity(entity).contains::<LandMesh>(),
+                    "a LOD terrain render mesh lacks LandMesh"
+                );
+            }
         }
         assert_eq!(
             *app.world().get::<Visibility>(entity).unwrap(),

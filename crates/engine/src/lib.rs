@@ -38,6 +38,8 @@ pub mod nif_material;
 pub mod object_materials;
 pub mod output_scale;
 pub mod pacing;
+pub mod papyrus_host;
+pub mod papyrus_plugin;
 pub mod papyrus_runtime;
 pub mod physics;
 pub mod prepass_vertex_alpha;
@@ -65,7 +67,10 @@ mod streaming_preparation;
 mod streaming_trace;
 pub mod sun;
 pub mod swap_bridge;
+mod terrain_lod_noise;
 pub mod terrain_merge;
+#[cfg(test)]
+mod terrain_normal;
 pub mod terrain_upload;
 #[cfg(test)]
 mod test_support;
@@ -80,6 +85,7 @@ mod vendored_morph_shader;
 pub mod visibility_optimization;
 pub mod visual_profile;
 mod water_depth;
+pub mod weather_sky;
 pub mod world;
 
 pub use app::run;

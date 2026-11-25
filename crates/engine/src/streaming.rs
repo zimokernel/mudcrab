@@ -23,8 +23,8 @@ use crate::{
             WorldPosition, WorldTransform,
         },
         database::{
-            AssetCatalog, CellKey, CellPayload, DatabaseRequest, WaterColors, WaterNoise,
-            WorldDatabase,
+            AssetCatalog, CellKey, CellPayload, DatabaseRequest, ReferenceRow, WaterColors,
+            WaterNoise, WorldDatabase,
         },
         water::{FlatWater, FlatWaterBody},
     },
@@ -36,6 +36,7 @@ use bevy::{
     ecs::system::SystemParam,
     gltf::{GltfExtras, GltfMaterialName, GltfSceneExtras},
     image::{ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler},
+    light::NotShadowCaster,
     math::Affine3A,
     mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
     prelude::*,
@@ -57,10 +58,15 @@ use std::time::Instant;
 
 pub(crate) mod admission;
 pub(crate) mod control;
+mod large_references;
+#[cfg(test)]
+mod local_light_tests;
 pub(crate) mod lod;
+pub(crate) mod lod_object_material;
 pub mod lod_objects;
 #[cfg(test)]
 mod merged_tests;
+pub(crate) mod near_terrain_blend;
 mod priority;
 pub(crate) mod requests;
 mod reservations;
@@ -138,11 +144,15 @@ pub enum StaticColliderSource {
 
 impl Plugin for StreamingPlugin {
     fn build(&self, app: &mut App) {
+        if app.world().contains_resource::<Assets<Shader>>() {
+            lod_object_material::build(app);
+        }
         app.init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingCommitBudget>()
             .init_resource::<lod::LodStreaming>()
             .init_resource::<lod_objects::LodObjects>()
+            .init_resource::<large_references::LargeReferences>()
             .init_resource::<DiagnosticFallbackAssets>()
             .init_resource::<TerrainContinuity>()
             .init_resource::<SceneSpawnBatch>()
@@ -155,6 +165,22 @@ impl Plugin for StreamingPlugin {
             .init_resource::<crate::pacing::PacingTracker>()
             .add_observer(mark_world_instance_ready)
             .add_observer(lod::mark_lod_world_instance_ready)
+            .add_observer(lod_objects::mark_object_scene_ready)
+            .add_systems(
+                PostUpdate,
+                (
+                    lod_objects::update_object_visibility,
+                    lod_objects::tag_object_cells,
+                    large_references::resolve_visibility,
+                    lod_objects::hide_loaded_object_cells,
+                )
+                    .chain()
+                    .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
+            )
+            .add_systems(
+                Update,
+                apply_land_shadow_policy.after(lod::update_terrain_lod_visibility),
+            )
             .add_systems(
                 Update,
                 lod_objects::update_lod_objects
@@ -171,16 +197,17 @@ impl Plugin for StreamingPlugin {
                     plan_cells,
                     despawn_cells,
                     lod::plan_lod_chunks,
-                    collect_cells,
+                    (collect_cells, large_references::update).chain(),
                     lod::collect_lod_chunks,
                     requests::dispatch_scene_requests,
                     arm_pending_models,
-                    track_asset_readiness,
+                    (track_asset_readiness, large_references::set_deadlines).chain(),
                     track_surface_readiness,
                     track_merged_surface_readiness,
                     lod::track_lod_readiness,
                     lod::batch_ready_lod_chunks,
                     lod::update_terrain_lod_visibility,
+                    near_terrain_blend::update_near_terrain_blend,
                     finish_streaming_commit_budget,
                     update_render_origin,
                     validate_streaming_lifecycle,
@@ -454,6 +481,7 @@ pub struct StreamingMetrics {
     pub retire_backlog_overflows: u64,
     pub resident_cells: usize,
     pub loading_cells: usize,
+    pub loading_large_reference_cells: usize,
     pub peak_resident_cells: usize,
     pub peak_loading_cells: usize,
     pub total_query_micros: u64,
@@ -481,6 +509,10 @@ pub struct StreamingMetrics {
     pub diagnostic_fallbacks: u64,
     pub canonical_fixture_validated: bool,
     pub terrain_patches_validated: u64,
+    /// Requested cell updates without a loaded near-terrain noise image.
+    pub near_terrain_blend_missing_noise: u64,
+    /// Requested cell updates without a ready near-terrain atlas.
+    pub near_terrain_blend_missing_atlas: u64,
     /// Exterior cells drawn as one merged mesh with the shared terrain material (#215).
     pub terrain_cells_merged: u64,
     /// Terrain cells drawn by the four-quadrant path: every cell when the merged path is absent
@@ -1123,10 +1155,13 @@ fn despawn_cells(world: &mut World) {
     retiring.sort_by_key(|(key, _)| cell_order_key(*key));
     let backlog = retiring.len();
     let overflow = backlog > backlog_bound;
+    if !overflow && let Some(large) = world.get_resource::<large_references::LargeReferences>() {
+        retiring.retain(|(key, _)| !large.holds_ordinary(*key));
+    }
     let budget = if overflow {
         backlog
     } else {
-        budget.min(backlog)
+        budget.min(retiring.len())
     };
     let started = Instant::now();
     let mut entities = 0usize;
@@ -1436,6 +1471,10 @@ fn collect_cells(
                     config.lights,
                     config.interactive_world_physics(),
                     requests::enabled(&config),
+                    large_references::window_enabled(
+                        config.stream_radius,
+                        config.large_ref_grid_radius(),
+                    ),
                     payload,
                     terrain,
                     merged,
@@ -1594,6 +1633,41 @@ fn roots_outside_window<'a>(
         })
 }
 
+/// Resolve a full-detail reference transform in the owning root's coordinate system.
+fn reference_placement(
+    key: CellKey,
+    reference: &ReferenceRow,
+) -> (
+    WorldPosition,
+    Transform,
+    Option<ExpectedModelBounds>,
+    Option<InstanceBounds>,
+) {
+    let creation_position = Vec3::from_array(reference.position);
+    let world_position = WorldPosition::from_creation_units(creation_position);
+    let translation = match key {
+        CellKey::Exterior { grid_x, grid_y, .. } => {
+            let cell_origin = IVec2::new(grid_x, grid_y);
+            creation_to_bevy(world_position.relative_to(cell_origin))
+        }
+        CellKey::Interior(_) => creation_to_bevy(creation_position),
+    };
+    let rotation = creation_rotation_to_bevy(reference.rotation);
+    let transform = Transform::from_translation(translation)
+        .with_rotation(rotation)
+        .with_scale(Vec3::splat(reference.scale));
+    let model_bounds = reference.bounds_valid.then(|| {
+        ExpectedModelBounds::new(
+            Vec3::from_array(reference.bounds_min),
+            Vec3::from_array(reference.bounds_max),
+        )
+    });
+    let model_bounds = model_bounds.flatten();
+    let bounds = model_bounds
+        .map(|bounds| InstanceBounds::transformed(bounds.min, bounds.max, transform.to_matrix()));
+    (world_position, transform, model_bounds, bounds)
+}
+
 /// Build a cell hierarchy and request its model scenes, recording their IDs for optional tracing.
 #[allow(clippy::too_many_arguments)]
 fn spawn_cell(
@@ -1609,6 +1683,7 @@ fn spawn_cell(
     lights: bool,
     terrain_physics: bool,
     schedule_scenes: bool,
+    manage_large_references: bool,
     payload: CellPayload,
     mut terrain: Option<TerrainSnapshot>,
     merged: Option<MergedSpawn>,
@@ -1675,6 +1750,17 @@ fn spawn_cell(
     if let CellKey::Exterior { grid_x, grid_y, .. } = payload.key {
         root_commands.insert(ExteriorCellGrid(IVec2::new(grid_x, grid_y)));
     }
+    let large_members = manage_large_references
+        .then(|| catalog.large_references.members.get(&payload.key))
+        .flatten();
+    if let Some(members) = large_members {
+        root_commands.insert(large_references::ordinary_members(
+            payload.key,
+            members,
+            &payload.references,
+            actor_catalog,
+        ));
+    }
     let root = root_commands.id();
     commands.entity(root).with_children(|parent| {
         if let Some(terrain) = terrain {
@@ -1682,7 +1768,9 @@ fn spawn_cell(
                 // Waiting for the render world from birth, like a quadrant: the grid's LOD tiles
                 // stay drawn until the bridge confirms the merged mesh drawn
                 // (`lod::update_terrain_lod_visibility`). The cell declares the shared material and
-                // every land texture array it binds.
+                // every land texture array it binds. The later seam material binds its atlas
+                // and noise after the swap. Merged surface accounting tracks the spawn resources
+                // only, so it omits these later bindings.
                 let surface = SwapSurface::new(material.id().untyped(), images.iter().copied());
                 let mut patch = parent.spawn((
                     Name::new("Terrain cell"),
@@ -1832,11 +1920,29 @@ fn spawn_cell(
                     }
                     _ => None,
                 };
+                // The flow maps of the east, south and south-east neighbours, which the flow
+                // program's shifted taps read at this cell's edges (RF-WATER-063). A neighbour
+                // without a map in the pack stays unbound.
+                let flow_neighbours: [Option<Handle<Image>>; 3] =
+                    flow_neighbour_paths(flow.as_ref().map(|(grid, _)| *grid), |cell| {
+                        catalog.water_flow_map(cell.x, cell.y)
+                    })
+                    .map(|path| {
+                        path.map(|path| {
+                            asset_server
+                                .load_builder()
+                                .with_settings(|settings: &mut ImageLoaderSettings| {
+                                    settings.is_srgb = false;
+                                })
+                                .load::<Image>(path)
+                        })
+                    });
                 let water_material = water_materials.add(water_material(
                     water_colors,
                     reflection.0.clone(),
                     flow_normal.clone(),
                     flow.clone(),
+                    flow_neighbours.clone(),
                     noise.map(|noise| (noise, noise_textures.clone())),
                     matches!(payload.key, CellKey::Interior(_)),
                 ));
@@ -1855,6 +1961,7 @@ fn spawn_cell(
                         cell_id: terrain.cell_id,
                         flow_normal,
                         flow,
+                        flow_neighbours,
                         noise: noise_textures.into_iter().flatten().collect(),
                     },
                     RenderLayers::layer(WATER_LAYER),
@@ -1870,29 +1977,16 @@ fn spawn_cell(
             if !reference.initially_enabled {
                 continue;
             }
-            let creation_position = Vec3::from_array(reference.position);
-            let world_position = WorldPosition::from_creation_units(creation_position);
-            let translation = match payload.key {
-                CellKey::Exterior { grid_x, grid_y, .. } => {
-                    let cell_origin = IVec2::new(grid_x, grid_y);
-                    creation_to_bevy(world_position.relative_to(cell_origin))
-                }
-                CellKey::Interior(_) => creation_to_bevy(creation_position),
-            };
-            let rotation = creation_rotation_to_bevy(reference.rotation);
-            let transform = Transform::from_translation(translation)
-                .with_rotation(rotation)
-                .with_scale(Vec3::splat(reference.scale));
-            let model_bounds = reference.bounds_valid.then(|| {
-                ExpectedModelBounds::new(
-                    Vec3::from_array(reference.bounds_min),
-                    Vec3::from_array(reference.bounds_max),
-                )
-            });
-            let model_bounds = model_bounds.flatten();
-            let bounds = model_bounds.map(|bounds| {
-                InstanceBounds::transformed(bounds.min, bounds.max, transform.to_matrix())
-            });
+            let large_member =
+                large_members.is_some_and(|members| members.contains(&reference.form_id));
+            if large_member
+                && let CellKey::Exterior { grid_x, grid_y, .. } = payload.key
+                && !crate::world::database::large_reference_in_bucket(&reference, grid_x, grid_y)
+            {
+                continue;
+            }
+            let (world_position, transform, model_bounds, bounds) =
+                reference_placement(payload.key, &reference);
             // A referenced `NPC_` with a catalog row becomes one actor entity. A row the catalog
             // could not resolve, or one with no body to draw, skips the reference entirely: no
             // placeholder, no static mesh, and exactly one diagnostic naming the base FormID.
@@ -1924,6 +2018,12 @@ fn spawn_cell(
                 // instead of inserted here; see `render::add_placed_object_layer_propagation`.
                 Propagate(PLACED_OBJECT_RENDER_LAYERS),
             ));
+            if large_member {
+                entity.insert((
+                    large_references::LargeReferenceModel { ready: false },
+                    Visibility::Hidden,
+                ));
+            }
             if let Some(bounds) = bounds.zip(model_bounds) {
                 entity.insert(bounds);
             }
@@ -2007,14 +2107,21 @@ fn spawn_cell(
             // A child of the reference, so the light sits where the reference is and follows it
             // through a render-origin rebase - and, because it is a descendant of the cell root,
             // through the cell unload that despawns the reference.
-            if let Some(light) = reference
+            let evaluated_light = reference
                 .light
                 .as_ref()
-                .and_then(|row| crate::lights::point_light(row, reference.light_radius_override))
-            {
+                .map(|row| crate::lights::evaluate_light(row, reference.light_radius_override));
+            if let Some(evaluation) = &evaluated_light {
+                entity.insert(evaluation.clone());
+            }
+            let shadow_flagged = evaluated_light
+                .as_ref()
+                .is_some_and(crate::lights::LightEvaluation::shadow_flagged);
+            if let Some(light) = evaluated_light.and_then(|evaluation| evaluation.point_light()) {
                 let marker = crate::lights::SkyrimLight {
                     form_id: reference.form_id,
                     cell_id: reference.cell_id,
+                    shadow_flagged,
                 };
                 if !lights {
                     entity.insert(crate::lights::DeferredPointLight { light, marker });
@@ -2960,6 +3067,9 @@ struct PendingWaterProfile {
     /// The cell's grid coordinates and flow map. It is optional: one that fails to load leaves the
     /// water on its noise layers instead of hiding it.
     flow: Option<(IVec2, Handle<Image>)>,
+    /// The east, south and south-east neighbours' flow maps (`None` where the pack has none). They
+    /// are optional too: one that fails to load leaves the cell clamping to its own edge texels.
+    flow_neighbours: [Option<Handle<Image>>; 3],
     /// The noise normal maps. They are optional detail: one that fails to load leaves the water
     /// flat instead of hiding it.
     noise: Vec<Handle<Image>>,
@@ -3065,6 +3175,7 @@ type PendingAssetQuery<'world, 'state> = Query<
         &'static GlobalTransform,
         &'static WorldTransform,
         Option<&'static ExpectedModelBounds>,
+        Option<&'static mut large_references::LargeReferenceModel>,
     ),
 >;
 
@@ -3293,7 +3404,7 @@ fn track_asset_readiness(
     mut commands: Commands,
     config: Res<EngineConfig>,
     asset_server: Res<AssetServer>,
-    pending: PendingAssetQuery,
+    mut pending: PendingAssetQuery,
     unarmed: Query<(), (With<PendingAssetProfile>, Without<WorldAssetRoot>)>,
     children: Query<&Children>,
     scene_extras: Query<&GltfSceneExtras>,
@@ -3326,7 +3437,9 @@ fn track_asset_readiness(
     // Live dynamic clutter bodies, including the ones this scan spawns (their commands are
     // deferred, so the query cannot see them yet). The cap bounds what a cell arrival can create.
     let mut live_clutter = clutter.iter().count();
-    for (entity, root, pending, local, global, world_transform, expected_bounds) in &pending {
+    for (entity, root, pending, local, global, world_transform, expected_bounds, large_model) in
+        &mut pending
+    {
         if completed_this_scan != 0
             && runtime
                 .as_ref()
@@ -3646,6 +3759,9 @@ fn track_asset_readiness(
             metrics.max_asset_ready_micros = metrics.max_asset_ready_micros.max(micros);
             profiler.record_completed_latency_micros("assets/model_ready", micros);
             profiler.event(&pending.path, "asset_ready", Some(micros as f64 / 1000.0));
+            if let Some(mut model) = large_model {
+                model.ready = true;
+            }
             commands.entity(entity).remove::<PendingAssetProfile>();
             completed_this_scan += 1;
         }
@@ -3879,6 +3995,61 @@ fn weld_merged_cell(
     Ok(())
 }
 
+/// A coverage node whose coverage or children changed: the only place a LOD source mesh can be
+/// found, since the mesh child carries no coverage of its own.
+type ChangedCoverageNode = (
+    With<TerrainCoverage>,
+    Or<(Added<TerrainCoverage>, Changed<Children>)>,
+);
+
+/// A terrain mesh that has not been given [`NotShadowCaster`] yet.
+type UncastingTerrain = (
+    With<Mesh3d>,
+    Or<(
+        With<TerrainPatch>,
+        With<TerrainCoverage>,
+        With<lod::terrain_batching::LandMesh>,
+    )>,
+    Without<NotShadowCaster>,
+);
+
+/// Apply the default land-shadow policy from Mudcrab #949 to terrain meshes.
+/// A mesh that already has `NotShadowCaster` keeps it, including with land shadows enabled.
+/// This marker applies to directional, point, and spot lights. Receiving is unchanged.
+///
+///
+/// Terrain is found through [`TerrainPatch`], [`TerrainCoverage`] and
+/// [`lod::terrain_batching::LandMesh`] on the mesh itself, and through the mesh children of a
+/// [`TerrainCoverage`] node: a LOD chunk's quadrant node carries the coverage and its single
+/// primitive child carries the mesh, and that child draws until the chunk is batched.
+///
+/// Cost: the `terrain` query has archetype filters only, so once a mesh has the marker it matches
+/// no archetype and costs nothing. `covered_nodes` visits only entities that carry a
+/// [`TerrainCoverage`] and whose coverage or `Children` changed. Both arrival orders are handled
+/// there: the node gaining coverage after its child exists (`Added<TerrainCoverage>`), and a child
+/// spawning under a covered node (`Changed<Children>`). No other mesh in the world is looked at.
+fn apply_land_shadow_policy(
+    config: Option<Res<crate::config::EngineConfig>>,
+    terrain: Query<Entity, UncastingTerrain>,
+    covered_nodes: Query<&Children, ChangedCoverageNode>,
+    uncasting_meshes: Query<(), (With<Mesh3d>, Without<NotShadowCaster>)>,
+    mut commands: Commands,
+) {
+    if config.is_some_and(|config| config.land_shadows) {
+        return;
+    }
+    for entity in &terrain {
+        commands.entity(entity).insert(NotShadowCaster);
+    }
+    for children in &covered_nodes {
+        for child in children.iter() {
+            if uncasting_meshes.contains(child) {
+                commands.entity(child).insert(NotShadowCaster);
+            }
+        }
+    }
+}
+
 /// Makes a spawned merged terrain mesh visible and its collider live. Its arrays were validated
 /// before any cell was committed, so there is nothing left to wait for.
 fn track_merged_surface_readiness(
@@ -4032,6 +4203,33 @@ fn track_surface_readiness(
                     );
                     if let Some(mut material) = water_materials.get_mut(&material.0) {
                         material.extension = material.extension.clone().with_flow(*grid, None);
+                    }
+                    profiler.increment("water/flow_fallbacks", 1);
+                }
+                SurfaceDependencyState::Ready => {}
+            }
+            // The neighbours' flow maps: while they load the water waits, and one that fails
+            // leaves the cell clamping to its own edge texels.
+            let neighbours: Vec<_> = pending.flow_neighbours.iter().flatten().cloned().collect();
+            match validate_surface_dependencies(
+                &asset_server,
+                &images,
+                &neighbours,
+                SurfaceImageKind::Water,
+                profile.decodes_colour_srgb(),
+            ) {
+                SurfaceDependencyState::Pending => continue,
+                SurfaceDependencyState::Failed(reason) => {
+                    warn!(
+                        cell = format_args!("{:08X}", pending.cell_id),
+                        %reason,
+                        "water neighbour flow map failed; the flow clamps at the cell edge"
+                    );
+                    if let Some(mut material) = water_materials.get_mut(&material.0) {
+                        material.extension = material
+                            .extension
+                            .clone()
+                            .with_flow_neighbours([None, None, None]);
                     }
                     profiler.increment("water/flow_fallbacks", 1);
                 }
@@ -5481,6 +5679,20 @@ impl TerrainCoverage {
     }
 }
 
+/// The flow-map files of the east, south and south-east neighbours of a water cell that runs the
+/// flow program at `grid` (RF-WATER-063), through `map`, which gives a cell's file when the pack
+/// has one. A cell that does not run the flow program (`grid` is `None`) reads no neighbour: a
+/// cell next to a flow cell, such as (38, 15) over (38, 14), never takes its map.
+fn flow_neighbour_paths(
+    grid: Option<IVec2>,
+    map: impl Fn(IVec2) -> Option<String>,
+) -> [Option<String>; 3] {
+    match grid {
+        Some(grid) => crate::render::water_flow_neighbour_cells(grid).map(map),
+        None => [None, None, None],
+    }
+}
+
 /// The material for a cell's water from its catalog row: the record's colours, reflectivity factors,
 /// opacity and above-water fog, with Skyrim's DefaultWater for whatever the database does not carry.
 fn water_material(
@@ -5488,6 +5700,7 @@ fn water_material(
     reflection: Handle<Image>,
     flow_normal: Option<Handle<Image>>,
     flow: Option<(IVec2, Handle<Image>)>,
+    flow_neighbours: [Option<Handle<Image>>; 3],
     noise: Option<(&WaterNoise, [Option<Handle<Image>>; 3])>,
     interior: bool,
 ) -> WaterMaterial {
@@ -5538,7 +5751,9 @@ fn water_material(
                 colors.and_then(|colors| colors.fog).unwrap_or_default(),
             );
     if let Some((grid, flow_map)) = flow {
-        extension = extension.with_flow(grid, Some(flow_map));
+        extension = extension
+            .with_flow(grid, Some(flow_map))
+            .with_flow_neighbours(flow_neighbours);
     }
     // A water whose record bytes give no noise layers stays flat.
     if let Some((noise, textures)) = noise {
@@ -5632,6 +5847,36 @@ mod tests {
         );
     }
 
+    /// A flow cell binds the maps of its east, south and south-east neighbours where the pack has
+    /// them; a cell that does not run the flow program binds none, even beside a flow cell. The Sea
+    /// of Ghosts cells have maps for (38,13), (38,14), (39,14) and (40,14) (RF-WATER-065); (38,15)
+    /// has no water record of its own, uses DefaultWater, and must not take (38,14)'s map.
+    #[test]
+    fn a_flow_cell_reads_its_neighbours_maps_and_a_noise_cell_reads_none() {
+        let maps = [(38, 13), (38, 14), (39, 14), (40, 14)];
+        let file = |cell: IVec2| {
+            maps.contains(&(cell.x, cell.y))
+                .then(|| format!("flow.{}.{}.ktx2", cell.x, cell.y))
+        };
+        // (38,14): east (39,14) and south (38,13) exist, south-east (39,13) does not.
+        assert_eq!(
+            flow_neighbour_paths(Some(IVec2::new(38, 14)), file),
+            [
+                Some("flow.39.14.ktx2".to_owned()),
+                Some("flow.38.13.ktx2".to_owned()),
+                None
+            ]
+        );
+        // (38,15) runs the non-flow program (no flow grid): it binds nothing, though the map of
+        // (38,14), the cell south of it, is in the pack.
+        assert_eq!(flow_neighbour_paths(None, file), [None, None, None]);
+        // (40,14) is the last map: its east (41,14) and south (40,13) are absent.
+        assert_eq!(
+            flow_neighbour_paths(Some(IVec2::new(40, 14)), file),
+            [None, None, None]
+        );
+    }
+
     #[test]
     fn a_waters_catalog_fog_reaches_its_material() {
         use crate::world::database::{WaterFog, water_fixtures::water_record_with_fog};
@@ -5677,6 +5922,7 @@ mod tests {
                 Handle::default(),
                 None,
                 None,
+                [None, None, None],
                 None,
                 false,
             )
@@ -5721,7 +5967,15 @@ mod tests {
             underwater_fog: None,
         };
         let multiplier = crate::sky::SkyPalette::SKYRIM_CLEAR_DAY_WATER_MULTIPLIER;
-        let material = water_material(Some(colors), Handle::default(), None, None, None, false);
+        let material = water_material(
+            Some(colors),
+            Handle::default(),
+            None,
+            None,
+            [None, None, None],
+            None,
+            false,
+        );
         // The water is drawn in Bevy's transmissive phase so it can refract the scene copy
         // (RF-WATER-049): an opaque alpha mode and a material that reads the transmission texture.
         assert_eq!(material.base.alpha_mode, AlphaMode::Opaque);
@@ -5747,7 +6001,15 @@ mod tests {
             .to_linear();
         assert!((sun.x - sunlight.red).abs() < 1.0e-6);
         assert_eq!(interior, 0.0);
-        let indoors = water_material(Some(colors), Handle::default(), None, None, None, true);
+        let indoors = water_material(
+            Some(colors),
+            Handle::default(),
+            None,
+            None,
+            [None, None, None],
+            None,
+            true,
+        );
         assert_eq!(indoors.extension.colours().3, 1.0);
     }
 
@@ -9374,6 +9636,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             CellPayload {
                 generation: 1,
                 key: CellKey::Exterior {
@@ -9385,6 +9648,7 @@ mod tests {
                 references: vec![ReferenceRow {
                     form_id: 0x00F9907,
                     initially_enabled: true,
+                    enable_state_unresolved: false,
                     has_multibound_override: false,
                     named_room_target: false,
                     starts_dead: false,
@@ -10416,6 +10680,11 @@ mod tests {
             radius,
             color,
             flags,
+            fade: None,
+            fade_status: None,
+            falloff: None,
+            reference_data: None,
+            radius_status: None,
         }
     }
 
@@ -10430,6 +10699,7 @@ mod tests {
         ReferenceRow {
             form_id,
             initially_enabled: true,
+            enable_state_unresolved: false,
             has_multibound_override: false,
             named_room_target: false,
             starts_dead: false,
@@ -10473,6 +10743,9 @@ mod tests {
         mut water_materials: ResMut<Assets<WaterMaterial>>,
         mut profiler: ResMut<ProfilingState>,
     ) {
+        if root.0.is_some() {
+            return;
+        }
         root.0 = Some(
             spawn_cell(
                 &mut commands,
@@ -10485,6 +10758,7 @@ mod tests {
                 &mut water_materials,
                 IVec2::ZERO,
                 config.lights,
+                false,
                 false,
                 false,
                 CellPayload {
@@ -10517,7 +10791,7 @@ mod tests {
 
     /// An app that spawns one interior cell holding `references` through the real [`spawn_cell`],
     /// with the engine's lights flag set as `lights`.
-    fn spawn_reference_cell_app(references: Vec<ReferenceRow>, lights: bool) -> App {
+    pub(super) fn spawn_reference_cell_app(references: Vec<ReferenceRow>, lights: bool) -> App {
         spawn_reference_cell_app_with_catalog(references, lights, ActorCatalog::default())
     }
 
@@ -10580,6 +10854,9 @@ mod tests {
             false,
         );
         app.insert_resource(AssetCatalog::open(&path).unwrap());
+        // `spawn_queued_references` spawns one cell and then stops; clear the root so the
+        // update below spawns the references again against the catalogue with the swap rows.
+        app.insert_resource(SpawnedCellRoot::default());
         app.update();
         let mut query = app.world_mut().query::<(
             &FormId,
@@ -11353,7 +11630,7 @@ mod tests {
     }
 
     /// Every reference the cell spawned, by the form id it was placed with.
-    fn reference_entity(app: &App, form_id: u32) -> Entity {
+    pub(super) fn reference_entity(app: &App, form_id: u32) -> Entity {
         let root = app
             .world()
             .resource::<SpawnedCellRoot>()
@@ -11737,7 +12014,7 @@ mod tests {
                     armo_id: 0x5b69f,
                     armature_id: 0x5b6a2,
                     biped_mask: shared::actor_outfits::BIPED_BODY,
-                    armature_race_id: 25,
+                    armature_race_id: Some(25),
                     scene: "meshes/clothes/blacksmith/m/torso_1.glb".into(),
                 }],
             }],
@@ -12153,13 +12430,10 @@ mod tests {
         let (light_entity, light, marker) = lights[0];
         assert_eq!(marker.form_id, 0x100);
         assert_eq!(marker.cell_id, 99);
-        assert_eq!(
-            light.range, 850.8,
-            "the reference's XRDS radius wins over the record's 256"
-        );
+        assert_eq!(light.range, 1106.8, "signed XRDS adds to the record radius");
         assert_eq!(light.color, Color::srgb_u8(255, 200, 120));
         assert!(
-            (light.intensity - crate::lights::intensity_for_radius(850.8)).abs() < 1.0e3,
+            (light.intensity - crate::lights::retail_intensity(1.0)).abs() < 1.0e3,
             "{}",
             light.intensity
         );
@@ -12217,10 +12491,10 @@ mod tests {
         );
     }
 
-    /// The flag is the whole switch: the same cell places no light at all without `--lights`, and
-    /// the references themselves are spawned exactly as before.
+    /// The setting is the whole switch: the same cell places no light at all with lights off
+    /// (`--no-lights`), and the references themselves are spawned exactly as before.
     #[test]
-    fn places_no_light_without_the_lights_flag() {
+    fn places_no_light_with_lights_off() {
         let mut app = spawn_reference_cell_app(
             vec![lit_reference(
                 0x100,
@@ -12251,6 +12525,162 @@ mod tests {
             Some(&FormId(0x100)),
             "and the reference is still spawned"
         );
+    }
+}
+
+#[cfg(test)]
+mod land_shadow_tests {
+    use super::*;
+    use bevy::light::NotShadowReceiver;
+
+    fn coverage() -> TerrainCoverage {
+        TerrainCoverage {
+            grid: IVec2::ZERO,
+            quadrant: 0,
+            tier: None,
+        }
+    }
+
+    /// Every terrain path, plus a mesh that is not terrain, and a receiver that must stay one.
+    struct Entities {
+        merged_or_patch: Entity,
+        lod_source: Entity,
+        lod_batch: Entity,
+        building: Entity,
+        receiver_free: Entity,
+    }
+
+    fn app(config: crate::config::EngineConfig) -> (App, Entities) {
+        let mut app = App::new();
+        app.insert_resource(config)
+            .add_systems(Update, apply_land_shadow_policy);
+        let world = app.world_mut();
+        let ids = Entities {
+            merged_or_patch: world.spawn((Mesh3d(Handle::default()), TerrainPatch)).id(),
+            lod_source: world.spawn((Mesh3d(Handle::default()), coverage())).id(),
+            lod_batch: world
+                .spawn((Mesh3d(Handle::default()), lod::terrain_batching::LandMesh))
+                .id(),
+            building: world.spawn(Mesh3d(Handle::default())).id(),
+            receiver_free: world
+                .spawn((Mesh3d(Handle::default()), TerrainPatch, NotShadowReceiver))
+                .id(),
+        };
+        app.update();
+        (app, ids)
+    }
+
+    fn casts(app: &App, entity: Entity) -> bool {
+        !app.world().entity(entity).contains::<NotShadowCaster>()
+    }
+
+    /// Retail: land casts no sun shadow by default (`bDrawLandShadows` = 0), on
+    /// every terrain path; other meshes keep casting.
+    #[test]
+    fn terrain_does_not_cast_sun_shadows_by_default() {
+        let config = crate::config::EngineConfig::default();
+        assert_eq!(config.land_shadows, crate::config::RETAIL_DRAW_LAND_SHADOWS);
+        assert!(!config.land_shadows, "retail bDrawLandShadows = 0");
+        let (app, world) = app(config);
+        for entity in [
+            world.merged_or_patch,
+            world.lod_source,
+            world.lod_batch,
+            world.receiver_free,
+        ] {
+            assert!(!casts(&app, entity), "{entity:?}");
+        }
+        assert!(
+            casts(&app, world.building),
+            "buildings and trees still cast"
+        );
+    }
+
+    /// `[Display] bDrawLandShadows=1` (`land_shadows`) leaves terrain casting.
+    #[test]
+    fn the_ini_setting_turns_land_shadow_casting_on() {
+        let config = crate::config::EngineConfig {
+            land_shadows: true,
+            ..default()
+        };
+        let (app, world) = app(config);
+        for entity in [
+            world.merged_or_patch,
+            world.lod_source,
+            world.lod_batch,
+            world.building,
+        ] {
+            assert!(casts(&app, entity), "{entity:?}");
+        }
+    }
+
+    /// Receiving is unchanged: the policy adds no `NotShadowReceiver` and keeps an existing one.
+    #[test]
+    fn receiving_is_unchanged() {
+        let (app, world) = app(crate::config::EngineConfig::default());
+        for entity in [world.merged_or_patch, world.lod_source, world.lod_batch] {
+            assert!(
+                !app.world().entity(entity).contains::<NotShadowReceiver>(),
+                "{entity:?} still receives"
+            );
+        }
+        assert!(
+            app.world()
+                .entity(world.receiver_free)
+                .contains::<NotShadowReceiver>(),
+            "a marker that was there stays"
+        );
+    }
+
+    /// A LOD chunk's quadrant node carries the coverage and its primitive child carries the mesh,
+    /// and that child draws until the chunk is batched. It must not cast, whichever of the two
+    /// appears first.
+    #[test]
+    fn the_mesh_child_of_a_lod_quadrant_node_does_not_cast() {
+        let (mut app, _) = app(crate::config::EngineConfig::default());
+        // The mesh first, the coverage later.
+        let node = app.world_mut().spawn_empty().id();
+        let child = app
+            .world_mut()
+            .spawn((Mesh3d(Handle::default()), ChildOf(node)))
+            .id();
+        app.update();
+        assert!(
+            casts(&app, child),
+            "no terrain node yet, so it is not terrain"
+        );
+        app.world_mut().entity_mut(node).insert(coverage());
+        app.update();
+        assert!(!casts(&app, child), "coverage arrived after the mesh");
+        // The coverage first, the mesh later.
+        let node = app.world_mut().spawn(coverage()).id();
+        app.update();
+        let child = app
+            .world_mut()
+            .spawn((Mesh3d(Handle::default()), ChildOf(node)))
+            .id();
+        app.update();
+        assert!(!casts(&app, child), "mesh arrived under a covered node");
+        // A building under an ordinary node still casts.
+        let building_node = app.world_mut().spawn_empty().id();
+        let building = app
+            .world_mut()
+            .spawn((Mesh3d(Handle::default()), ChildOf(building_node)))
+            .id();
+        app.update();
+        assert!(casts(&app, building));
+    }
+
+    /// Terrain that arrives later is handled in the frame it appears.
+    #[test]
+    fn later_terrain_is_handled_too() {
+        let (mut app, _) = app(crate::config::EngineConfig::default());
+        let late = app
+            .world_mut()
+            .spawn((Mesh3d(Handle::default()), coverage()))
+            .id();
+        app.update();
+        assert!(!casts(&app, late));
     }
 }
 

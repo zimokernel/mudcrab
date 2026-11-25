@@ -32,6 +32,7 @@ use crate::{
     integration::{IntegrationReport, finalize_world_database_with_sources},
     lod::{
         albedo::{LoadedDefault, TerrainAtlas, TerrainTextureCache, TerrainTextures},
+        retail_terrain_import::{CHECKPOINT_DIR, LodWorld, TerrainCheckpoint, import_world},
         reuse::{LodManifest, LodReuse},
         terrain::{
             PreparedTerrainChunk, TerrainCellCache, TerrainChunk, exterior_terrain_cells,
@@ -108,9 +109,15 @@ pub struct PipelineReport {
     pub lod_gpu_chunks: u64,
     #[serde(default)]
     pub lod_cpu_fallback_chunks: u64,
-    /// Wall time spent compiling terrain LOD, excluding other conversion stages.
+    /// Wall time spent building terrain and object LOD, excluding other conversion stages.
     #[serde(default)]
     pub lod_elapsed_ms: u128,
+    /// Retail object LOD chunks published this run (separate from the terrain `lod_chunks`).
+    #[serde(default)]
+    pub object_lod_chunks: u64,
+    /// Wall time of the object LOD stage, included in `lod_elapsed_ms`.
+    #[serde(default)]
+    pub object_lod_elapsed_ms: u128,
     /// Wall time of package publication, including seals/verification when replacing
     /// an output. Excludes subsequent ingestion-cache persistence and pruning.
     #[serde(default)]
@@ -153,6 +160,11 @@ pub struct PipelineReport {
     /// configured-default land texture fallbacks, that do not affect completeness.
     #[serde(default)]
     pub notices: Vec<String>,
+    /// Records omitted on purpose because they have no usable value, per plugin, record type and
+    /// reason class (#811). They stay visible here and in the manifest, and they do not make the
+    /// run incomplete; a read failure still does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intended_omissions: Vec<crate::cache::IntendedOmission>,
     /// Original plugin filenames omitted by selection recovery, once each in selection order.
     /// Full exclusions stay available without expanding the bounded user-facing warning summaries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -199,7 +211,30 @@ pub(crate) fn report_projection_omissions(
         match outcome.severity {
             Severity::DataLoss => report.warnings.push(message),
             Severity::Fallback => report.notices.push(message),
+            Severity::Omitted => {
+                report.notices.push(message);
+                report
+                    .intended_omissions
+                    .push(crate::cache::IntendedOmission {
+                        source: "world database".to_owned(),
+                        record_type: omitted_record_type(category).to_owned(),
+                        class: category.clone(),
+                        count: outcome.count,
+                        first_example: outcome.samples.first().map_or_else(String::new, |sample| {
+                            format!("{:08X}: {}", sample.form_id, sample.reason)
+                        }),
+                    });
+            }
         }
+    }
+}
+
+/// Record signature of an intended projection omission category, for the manifest rows.
+fn omitted_record_type(category: &str) -> &'static str {
+    match category {
+        "land_missing_heights" => "LAND",
+        "worldspace_missing_editor_id" => "WRLD",
+        _ => "unknown",
     }
 }
 
@@ -626,6 +661,7 @@ impl AssetPipeline {
             // A fresh run has no record losses when there are no selected plugins.
             // The authoritative reader replaces this proof when plugins are converted.
             record_data_complete: Some(true),
+            intended_omissions: Vec::new(),
             configuration_hash: expected_configuration.clone(),
             schema_addons: config.schemas()?.identities().to_vec(),
             asset_configuration_hashes: ["nif", "dds", "pex"]
@@ -1214,6 +1250,7 @@ impl AssetPipeline {
                 manifest.record_data_complete = Some(notes.warnings.is_empty());
                 report.warnings.extend(notes.warnings);
                 report.notices.extend(notes.notices);
+                report.intended_omissions.extend(notes.omissions);
                 send(
                     progress_tx,
                     ProgressStage::Database,
@@ -1259,11 +1296,13 @@ impl AssetPipeline {
                     &database_cache::ConversionNotes {
                         warnings: conversion.warnings.clone(),
                         notices: conversion.notices.clone(),
+                        omissions: conversion.omissions.clone(),
                     },
                 )?;
                 manifest.record_data_complete = Some(conversion.warnings.is_empty());
                 report.warnings.extend(conversion.warnings);
                 report.notices.extend(conversion.notices);
+                report.intended_omissions.extend(conversion.omissions);
                 let phases = conversion.phases;
                 let merged = conversion.records;
                 report.database_runtime_records_built = merged.len() as u64;
@@ -1765,15 +1804,14 @@ impl AssetPipeline {
                 }
             }
         }
-        // Keep the requested configuration/cache identity unchanged. Only this run's terrain
-        // consumers use white when a failed winner leaves bytes that cannot be removed.
-        let default_config = withdraw_default.then(|| {
-            let mut fallback = config.clone();
-            fallback.terrain_default_texture = crate::config::TerrainDefaultTexture::White;
-            fallback.terrain_ini = None;
-            fallback
-        });
-        let terrain_config = default_config.as_ref().unwrap_or(config);
+        // A failed winner whose stale bytes cannot be removed leaves no trustworthy default.
+        // The conversion fails; it does not switch to a generated white texture (#811, SI-23).
+        ensure!(
+            !withdraw_default,
+            "the default land texture input could not be replaced by its winning copy; \
+             no white texture is generated in its place. See the notices for the file"
+        );
+        let terrain_config = config;
         let lod_started = Instant::now();
         compile_lod_chunks_with_cancel(
             terrain_config,
@@ -1935,6 +1973,8 @@ impl AssetPipeline {
         }
         manifest.complete = conversion_is_complete(&report);
         report.complete = manifest.complete;
+        crate::cache::merge_intended_omissions(&mut report.intended_omissions);
+        manifest.intended_omissions = report.intended_omissions.clone();
         manifest.save(&staging.join("conversion-manifest.json"))?;
         report
             .artifacts
@@ -3565,9 +3605,10 @@ pub(crate) fn collect_texture_semantics(
 ) -> Result<BTreeMap<String, BTreeSet<TextureSemantic>>> {
     use rayon::prelude::*;
     let mut semantics = BTreeMap::<String, BTreeSet<TextureSemantic>>::new();
+    let checkpoint = staging.join(CHECKPOINT_DIR);
     let glbs: Vec<_> = discover(staging)?
         .into_iter()
-        .filter(|path| extension(path, &["glb"]))
+        .filter(|path| !path.starts_with(&checkpoint) && extension(path, &["glb"]))
         .collect();
     let dependencies = glbs
         .par_iter()
@@ -3730,9 +3771,11 @@ pub(crate) use publish_texture_aliases as publish_srgb_texture_aliases;
 /// Returns the published paths relative to staging; references without a source file are skipped.
 pub(crate) fn publish_texture_aliases(staging: &Path) -> Result<Vec<PathBuf>> {
     let mut aliases = BTreeSet::new();
+    let checkpoint = staging.join(CHECKPOINT_DIR);
     for entry in WalkDir::new(staging)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| entry.path() != checkpoint)
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_file() && extension(entry.path(), &["glb"]))
     {
@@ -4081,10 +4124,13 @@ pub(crate) fn validate_artifacts(
             },
         );
     });
-    match first_failure.into_inner().unwrap() {
-        Some((_, error)) => Err(error),
-        None => Ok(()),
+    if let Some((_, error)) = first_failure.into_inner().unwrap() {
+        return Err(error);
     }
+    // A listed object LOD chunk that is missing or damaged fails the package, as a damaged
+    // terrain chunk does. A pack without object LOD reads nothing here beyond the database table
+    // list.
+    crate::lod::objects::validate_object_lod_package(staging)
 }
 
 /// Checks one generated artifact. `lua` is the compiler for Luau scripts, created on first use so
@@ -4135,6 +4181,19 @@ pub(crate) fn validate_artifact(
                 path.display()
             );
         }
+        // Object LOD atlases have a fixed encoding and no source texture semantics.
+        Some("ktx2") if relative.starts_with("lod") => {
+            let bytes = fs::read(&path)?;
+            let validate = if relative.file_name()
+                == Some(std::ffi::OsStr::new(shared::lod::OBJECT_NORMAL_ATLAS_FILE))
+            {
+                crate::lod::objects::validate_normal_atlas_ktx2
+            } else {
+                crate::lod::objects::validate_atlas_ktx2
+            };
+            validate(&bytes)
+                .wrap_err_with(|| format!("invalid object LOD atlas {}", path.display()))?;
+        }
         Some("ktx2") => {
             let bytes = fs::read(&path)?;
             let key = source_texture_key(&canonical_asset_path(
@@ -4153,6 +4212,17 @@ pub(crate) fn validate_artifact(
                 "KTX2 metadata validation failed for {}",
                 path.display()
             );
+        }
+        // An object LOD chunk is checked in full: its file is small and a damaged one must not pass.
+        Some("glb")
+            if relative.starts_with("lod")
+                && relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("objects_")) =>
+        {
+            crate::lod::objects::validate_object_glb(&fs::read(&path)?)
+                .wrap_err_with(|| format!("invalid object LOD chunk {}", path.display()))?;
         }
         Some("glb") => {
             // Only the 12-byte GLB header is checked, so only the header is read.
@@ -4356,14 +4426,15 @@ fn plugin_paths_with_diagnostics(
     Ok(plugins)
 }
 
-/// Discards a failed optional default's staged bytes; true withdraws the default for this run.
+/// Discards a failed default's staged bytes; true means the stale bytes remain and the
+/// conversion must fail.
 fn discard_failed_default_input(path: &Path, report: &mut PipelineReport) -> bool {
     match fs::remove_file(path) {
         Ok(()) => false,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => {
             report.notices.push(format!(
-                "configured default withdrawn: failed to remove {}: {error}; using legacy null-base behaviour",
+                "failed to remove stale default land input {}: {error}",
                 path.display(),
             ));
             true
@@ -4646,9 +4717,10 @@ fn extension(path: &Path, expected: &[&str]) -> bool {
 /// downstream scans must see exactly the meshes publication will include.
 fn invalidate_staged_mesh_outputs(staging: &Path, verified: &BTreeSet<String>) -> Result<()> {
     let vfs = staging.join("vfs");
+    let checkpoint = staging.join(CHECKPOINT_DIR);
     for entry in WalkDir::new(staging)
         .into_iter()
-        .filter_entry(|entry| entry.path() != vfs.as_path())
+        .filter_entry(|entry| entry.path() != vfs && entry.path() != checkpoint)
     {
         let entry = entry?;
         if !entry.file_type().is_file() || !extension(entry.path(), &["glb"]) {
@@ -4733,9 +4805,10 @@ fn remove_orphan_staged_assets(staging: &Path, sources: &[PathBuf]) -> Result<()
             output_extension,
         )?));
     }
+    let checkpoint = staging.join(CHECKPOINT_DIR);
     for entry in WalkDir::new(staging)
         .into_iter()
-        .filter_entry(|entry| entry.path() != vfs.as_path())
+        .filter_entry(|entry| entry.path() != vfs && entry.path() != checkpoint)
     {
         let entry = entry?;
         let relative = entry.path().strip_prefix(staging)?;
@@ -5296,13 +5369,40 @@ async fn compile_lod_chunks_inline(
         crate::terrain_pipeline::TerrainDefaultDiffuse::GeneratedWhite,
         crate::terrain_pipeline::TerrainDefaultDiffuse::Image,
     );
+    let retail_terrain = config.terrain_lod_source == crate::config::TerrainLodSource::Retail;
     let (default_textures, default_error) =
         LoadedDefault::load(&default_diffuse, &staging.join("vfs"), &mut texture_cache);
-    if let Some(reason) = default_error {
+    if let Some(reason) = default_error
+        && !retail_terrain
+    {
         report.lod_warnings.push(format!(
             "terrain LOD default land texture falls back to the generated white one: {reason}"
         ));
     }
+    // List the retail files once. A listing failure still allows verified checkpoints to resume.
+    let mut terrain_listing_failed = false;
+    let retail_files = if retail_terrain {
+        let files = match crate::lod::retail_terrain_source::list(&config.data_dir) {
+            Ok(files) => {
+                report
+                    .lod_warnings
+                    .extend(files.archive_warnings.iter().cloned());
+                files
+            }
+            Err(error) => {
+                terrain_listing_failed = true;
+                report.lod_warnings.push(format!(
+                    "the retail terrain LOD files cannot be listed: {error:#}; no new terrain LOD is imported"
+                ));
+                Default::default()
+            }
+        };
+        Some((files, TerrainCheckpoint::open(staging, plugin_hashes)?))
+    } else {
+        None
+    };
+    let mut retail_inputs = BTreeMap::new();
+    let mut retail_payload_hashes = BTreeMap::new();
     let mut chunk_inputs = BTreeMap::new();
     let mut worlds: Vec<(u32, String)> = connection
         .prepare("SELECT id, editor_id FROM worldspaces ORDER BY id")?
@@ -5320,6 +5420,8 @@ async fn compile_lod_chunks_inline(
     )
     .await;
     let mut chunk_hashes: Vec<String> = Vec::new();
+    let mut terrain_reconciliation = crate::lod::reconciliation::LodReconciliation::new();
+    terrain_reconciliation.terrain_listing_failed = terrain_listing_failed;
     let mut world_settings = Vec::with_capacity(worlds.len());
     let mut compiled_worlds = 0u64;
     let mut terrain_sources = BTreeMap::new();
@@ -5407,6 +5509,106 @@ async fn compile_lod_chunks_inline(
             )
             .await;
             continue;
+        }
+        if let Some((files, checkpoint)) = &retail_files {
+            let file_name = editor_id.to_ascii_lowercase();
+            let ids: Vec<crate::lod::retail_terrain_source::BlockId> = files
+                .blocks
+                .keys()
+                .filter(|(world, ..)| *world == file_name)
+                .cloned()
+                .collect();
+            let world = LodWorld {
+                id: *worldspace_id,
+                editor_id: editor_id.clone(),
+                file_name,
+                origin,
+            };
+            if !terrain_listing_failed {
+                terrain_reconciliation.record_terrain_world(&world.file_name);
+            }
+            let imported = import_world(
+                &connection,
+                checkpoint,
+                &world,
+                files,
+                &ids,
+                &compiler_pool,
+                &mut retail_inputs,
+                &mut retail_payload_hashes,
+                || interrupt(cancellation),
+            )?;
+            let compiled: usize = imported.compiled.values().sum();
+            for (id, skipped) in &imported.skipped {
+                terrain_reconciliation.record_terrain_skip(
+                    &id.0,
+                    id.1,
+                    skipped.class,
+                    (id.2, id.3),
+                    crate::lod::reconciliation::SkipPresence::of(files, id),
+                );
+            }
+            report.lod_warnings.extend(imported.checkpoint_warnings);
+            let retained = imported.kept_from_previous_generation;
+            if ids.is_empty() && retained == 0 {
+                // List near matches, so a naming form the reader does not know is visible.
+                let block = format!("meshes/terrain/{0}/{0}.4.<x>.<y>.btr", world.file_name);
+                let near = files
+                    .index
+                    .describe_missing(&[&block], Some(&world.file_name));
+                report.lod_warnings.push(format!(
+                    "worldspace {editor_id} ({worldspace_id:08X}) has no retail terrain LOD files ({near}); its terrain LOD is skipped and nothing is generated in its place"
+                ));
+                if let Some(settings) = world_settings.last_mut() {
+                    settings["status"] = serde_json::json!("no_retail_files");
+                }
+            } else {
+                for (class, count) in &imported.skipped_by_class {
+                    report.lod_warnings.push(format!(
+                        "worldspace {editor_id} ({worldspace_id:08X}): {count} retail terrain LOD blocks skipped ({class}); first: {}",
+                        imported
+                            .skipped
+                            .iter()
+                            .find(|(_, skipped)| skipped.class == *class)
+                            .map_or("", |(_, skipped)| skipped.detail.as_str())
+                    ));
+                }
+                report.notices.push(format!(
+                    "Terrain LOD {editor_id}: {compiled} retail chunks imported ({} blocks found, {} skipped)",
+                    imported.found.values().sum::<usize>(),
+                    imported.skipped.len()
+                ));
+                if let Some(settings) = world_settings.last_mut() {
+                    settings["status"] = serde_json::json!(if compiled + retained == 0 {
+                        "no_retail_chunks"
+                    } else {
+                        "retail_imported"
+                    });
+                    settings["retail_chunks"] = serde_json::json!(compiled);
+                    settings["retail_skipped"] = serde_json::json!(imported.skipped.len());
+                    if retained > 0 {
+                        settings["retail_kept_from_previous_generation"] =
+                            serde_json::json!(retained);
+                    }
+                }
+                if retained > 0 {
+                    report.notices.push(format!(
+                        "Terrain LOD {editor_id}: {retained} retail chunks kept from previous generation"
+                    ));
+                }
+                report.lod_chunks += (compiled + retained) as u64;
+                compiled_worlds += 1;
+            }
+            send(
+                progress_tx,
+                ProgressStage::LodChunks,
+                (index + 1) as u64,
+                worlds.len() as u64,
+                None,
+                "Compiling terrain LOD chunks",
+            )
+            .await;
+            continue 'world;
         }
         let lookup: std::collections::HashMap<u32, (i32, i32)> = cells
             .iter()
@@ -5713,6 +5915,11 @@ async fn compile_lod_chunks_inline(
         );
         report.notices.push(message);
     }
+    chunk_hashes.extend(
+        retail_payload_hashes
+            .iter()
+            .map(|(path, hash)| format!("{path}:{hash}")),
+    );
     chunk_hashes.sort();
     let current_plugin_hashes = plugins
         .iter()
@@ -5722,13 +5929,25 @@ async fn compile_lod_chunks_inline(
         current_plugin_hashes == plugin_hashes,
         "plugin inputs changed during conversion; refusing to publish an LOD build from a mixed input generation"
     );
-    let lod_configuration = hash_bytes(&serde_json::to_vec(&serde_json::json!({
+    if let Some((_, checkpoint)) = &retail_files {
+        checkpoint.publish_payloads(staging, &retail_payload_hashes, || interrupt(cancellation))?;
+    }
+    for relative in retail_inputs.keys() {
+        report.artifacts.push(PathBuf::from(relative));
+    }
+    let mut lod_configuration_json = serde_json::json!({
         "assets": configuration_hash(config)?,
         "atlas_encoder": match config.lod_texture_encoder {
             TextureEncoder::Cpu => "cpu-terrain-uastc-v1".to_owned(),
             TextureEncoder::Gpu { quality, .. } => format!("terrain-atlas{}", texture_gpu::cache_label(quality)),
         },
-    }))?);
+    });
+    if retail_terrain {
+        lod_configuration_json["terrain_lod_source"] = serde_json::json!("retail");
+        lod_configuration_json["retail_import_version"] =
+            serde_json::json!(crate::lod::retail_terrain::IMPORT_VERSION);
+    }
+    let lod_configuration = hash_bytes(&serde_json::to_vec(&lod_configuration_json)?);
     let identity = build_identity(
         plugin_hashes,
         &chunk_hashes,
@@ -5740,8 +5959,43 @@ async fn compile_lod_chunks_inline(
         "INSERT OR REPLACE INTO lod_build(id, build_identity) VALUES (1, ?1)",
         rusqlite::params![identity],
     )?;
+    // Retail object LOD hangs off the terrain LOD just compiled (same worldspace origins), so it
+    // runs only when a world was compiled. It reads the Data folder directly and changes no
+    // ingestion input, so a pack's NIF, texture and script outputs are unaffected.
+    let object_lod = if compiled_worlds > 0 {
+        let started = Instant::now();
+        let stage = crate::lod::object_stage::build_object_lod(config, staging, &connection)?;
+        report.object_lod_chunks = stage.chunks.len() as u64;
+        report.object_lod_elapsed_ms = started.elapsed().as_millis();
+        report.notices.extend(stage.notices.iter().cloned());
+        report.lod_warnings.extend(stage.warnings.iter().cloned());
+        report
+            .artifacts
+            .extend(stage.chunks.iter().map(|(path, _)| PathBuf::from(path)));
+        report
+            .artifacts
+            .extend(stage.atlases.iter().map(|(path, _)| PathBuf::from(path)));
+        report.artifacts.extend(
+            stage
+                .normal_atlases
+                .iter()
+                .map(|(path, _)| PathBuf::from(path)),
+        );
+        stage
+    } else {
+        crate::lod::object_stage::ObjectLodStage::default()
+    };
     if compiled_worlds > 0 {
         report.artifacts.push(PathBuf::from("lod-manifest.json"));
+        terrain_reconciliation.objects_recorded_worlds =
+            object_lod.reconciliation.objects_recorded_worlds;
+        terrain_reconciliation.object_skips = object_lod.reconciliation.object_skips;
+        terrain_reconciliation.object_world_skips = object_lod.reconciliation.object_world_skips;
+        terrain_reconciliation.object_world_skip_blocks =
+            object_lod.reconciliation.object_world_skip_blocks;
+        // Always write the block, even with no skips, so a clean pack says which worlds were
+        // inspected instead of reading as unknown.
+        let reconciliation = Some(terrain_reconciliation);
         let manifest = LodManifest {
             build_identity: identity,
             converter_schema: CONVERTER_SCHEMA_VERSION,
@@ -5751,6 +6005,30 @@ async fn compile_lod_chunks_inline(
             terrain_sources,
             compiler_version: crate::lod::TERRAIN_COMPILER_VERSION,
             chunk_inputs,
+            terrain_lod_source: Some(
+                if retail_terrain {
+                    crate::lod::reuse::TERRAIN_SOURCE_RETAIL
+                } else {
+                    crate::lod::reuse::TERRAIN_SOURCE_SELF_BUILT
+                }
+                .to_owned(),
+            ),
+            retail_terrain_import_version: if retail_terrain {
+                crate::lod::retail_terrain::IMPORT_VERSION
+            } else {
+                0
+            },
+            retail_terrain_inputs: retail_inputs,
+            object_chunks: object_lod.chunks.len() as u64,
+            objects_compiler_version: if object_lod.chunks.is_empty() {
+                0
+            } else {
+                crate::lod::objects::OBJECT_COMPILER_VERSION
+            },
+            object_chunk_inputs: object_lod.chunks.iter().cloned().collect(),
+            object_atlases: object_lod.atlases.iter().cloned().collect(),
+            object_normal_atlases: object_lod.normal_atlases.iter().cloned().collect(),
+            reconciliation,
         };
         let bytes = serde_json::to_vec_pretty(&manifest)?;
         fs::write(staging.join("lod-manifest.json"), &bytes)?;
@@ -6882,9 +7160,22 @@ mod tests {
     use super::*;
     use crate::esm::cell_cache::write_cell_cache;
 
+    /// A config that selects the labelled `--terrain-default white` option. Fixtures without
+    /// landscape images need it: an unusable `skyrim-ini` default fails the conversion (#811).
+    fn white_default_config(
+        data: impl Into<PathBuf>,
+        output: impl Into<PathBuf>,
+    ) -> PipelineConfig {
+        let mut config = PipelineConfig::new(data, output);
+        config.terrain_default_texture = crate::config::TerrainDefaultTexture::White;
+        config
+    }
+
     fn cpu_lod_config(data: impl Into<PathBuf>, output: impl Into<PathBuf>) -> PipelineConfig {
         let mut config = PipelineConfig::new(data, output);
         config.lod_texture_encoder = TextureEncoder::Cpu;
+        // The fixtures have no retail terrain LOD files; these tests exercise the self-built stage.
+        config.terrain_lod_source = crate::config::TerrainLodSource::SelfBuilt;
         config
     }
 
@@ -7634,6 +7925,15 @@ mod tests {
                 terrain_sources,
                 compiler_version: crate::lod::TERRAIN_COMPILER_VERSION,
                 chunk_inputs,
+                terrain_lod_source: Some(crate::lod::reuse::TERRAIN_SOURCE_SELF_BUILT.to_owned()),
+                retail_terrain_import_version: 0,
+                retail_terrain_inputs: BTreeMap::new(),
+                object_chunks: 0,
+                objects_compiler_version: 0,
+                object_chunk_inputs: BTreeMap::new(),
+                object_atlases: BTreeMap::new(),
+                object_normal_atlases: BTreeMap::new(),
+                reconciliation: None,
             };
             Proof {
                 identity,
@@ -8383,6 +8683,525 @@ mod tests {
                 "producer {producer} meshes must not be reused"
             );
         }
+    }
+
+    /// Both retail LOD stages publish into the same pack during conversion and metadata rebuild.
+    /// The rebuild reuses the ordinary converted meshes and textures.
+    #[tokio::test]
+    async fn both_retail_lod_stages_publish_during_conversion_and_metadata_rebuild() {
+        use crate::lod::retail::bto::tests::{SHAPE, nif_bytes, shape_block};
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        dummy_content::layout::prepare_directory(&data, false).unwrap();
+        dummy_content::layout::generate(
+            &data,
+            dummy_content::layout::DEFAULT_SEED,
+            dummy_content::layout::Formats::parse("dds,pex,nif,esm,lodsettings").unwrap(),
+        )
+        .unwrap();
+        let mut config = cpu_lod_config(&data, directory.path().join("before"));
+        config.cpu_jobs = 2;
+        let before = run_without_progress(config.clone()).await;
+        assert!(before.complete && before.lod_chunks > 0);
+        assert_eq!(before.object_lod_chunks, 0);
+        let (editor_id, x, y): (String, i32, i32) = Connection::open(
+            directory.path().join("before/skyrim_world.db"),
+        )
+        .unwrap()
+        .query_row(
+            "SELECT editor_id, lod_origin_x, lod_origin_y FROM worldspaces w WHERE EXISTS(SELECT 1 FROM lod_chunks c WHERE c.worldspace_id = w.id) LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+        // A pack without object LOD has no object table and no manifest field.
+        let plain = Connection::open(directory.path().join("before/skyrim_world.db")).unwrap();
+        assert_eq!(
+            plain
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name LIKE 'lod_object%'",
+                    [],
+                    |row| row.get::<_, u32>(0)
+                )
+                .unwrap(),
+            0
+        );
+        let plain_manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.path().join("before/lod-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(plain_manifest.get("object_chunks").is_none());
+
+        // The retail files for that world: one level-16 block at its LOD origin, and an atlas.
+        let world = editor_id.to_ascii_lowercase();
+        let meshes = data.join(format!("meshes/terrain/{world}/objects"));
+        let textures = data.join(format!("textures/terrain/{world}/objects"));
+        fs::create_dir_all(&meshes).unwrap();
+        fs::create_dir_all(&textures).unwrap();
+        let block = shape_block(
+            [x as f32 * 4096.0, y as f32 * 4096.0, 0.0],
+            16.0,
+            &[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+            &[[0, 1, 2]],
+            &[(0, 0, 1)],
+            true,
+            true,
+        );
+        fs::write(
+            meshes.join(format!("{world}.16.{x}.{y}.bto")),
+            nif_bytes(&[(SHAPE, block)]),
+        )
+        .unwrap();
+        fs::write(
+            textures.join(format!("{world}.objects.dds")),
+            dummy_content::dds::generate(
+                &dummy_content::dds::Spec::new(dummy_content::dds::Format::X8R8G8B8, 8, 8),
+                &mut dummy_content::rng::Rng::new(5),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stem = format!("{world}.16.{x}.{y}");
+        fs::write(
+            data.join("meshes/terrain")
+                .join(&world)
+                .join(format!("{stem}.btr")),
+            crate::lod::retail::btr::tests::land_block(),
+        )
+        .unwrap();
+        let map = fs::read(textures.join(format!("{world}.objects.dds"))).unwrap();
+        let terrain_textures = data.join("textures/terrain").join(&world);
+        fs::write(terrain_textures.join(format!("{stem}.dds")), &map).unwrap();
+        fs::write(terrain_textures.join(format!("{stem}_n.dds")), &map).unwrap();
+        config.terrain_lod_source = crate::config::TerrainLodSource::Retail;
+
+        let check = |root: &Path, report: &PipelineReport| {
+            assert!(report.complete, "{:?}", report.warnings);
+            assert!(!root.join(CHECKPOINT_DIR).exists());
+            assert_eq!(report.object_lod_chunks, 1, "{:?}", report.lod_warnings);
+            let manifest: LodManifest =
+                serde_json::from_slice(&fs::read(root.join("lod-manifest.json")).unwrap()).unwrap();
+            assert_eq!(manifest.object_chunks, 1);
+            let reconciliation = manifest
+                .reconciliation
+                .as_ref()
+                .expect("a clean conversion still writes the reconciliation block");
+            assert!(reconciliation.terrain_recorded_worlds.contains(&world));
+            assert!(reconciliation.objects_recorded_worlds.contains(&world));
+            assert_eq!(report.lod_chunks, 1, "{:?}", report.lod_warnings);
+            assert_eq!(manifest.chunks, report.lod_chunks);
+            assert_eq!(
+                manifest.terrain_lod_source.as_deref(),
+                Some(crate::lod::reuse::TERRAIN_SOURCE_RETAIL)
+            );
+            assert_eq!(
+                manifest.retail_terrain_import_version,
+                crate::lod::retail_terrain::IMPORT_VERSION
+            );
+            assert_eq!(manifest.retail_terrain_inputs.len(), 1);
+            shared::world_assets::validate_lod_build_contract(root, CONVERTER_SCHEMA_VERSION)
+                .unwrap();
+            assert_eq!(manifest.object_chunk_inputs.len(), 1);
+            // One shared atlas file per world, listed with its hash and written once.
+            assert_eq!(manifest.object_atlases.len(), 1);
+            let (atlas_path, atlas_hash) = manifest.object_atlases.iter().next().unwrap();
+            assert_eq!(&hash_file(&root.join(atlas_path)).unwrap(), atlas_hash);
+            assert_eq!(
+                manifest.objects_compiler_version,
+                crate::lod::objects::OBJECT_COMPILER_VERSION
+            );
+            let database = Connection::open(root.join("skyrim_world.db")).unwrap();
+            let (path, hash): (String, String) = database
+                .query_row(
+                    "SELECT payload_path, content_hash FROM lod_object_chunks",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(hash_file(&root.join(&path)).unwrap(), hash);
+            // The package check the pipeline ran passes now and fails on a damaged chunk.
+            crate::lod::objects::validate_object_lod_package(root).unwrap();
+            let mut bytes = fs::read(root.join(&path)).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xff;
+            let damaged = directory.path().join("damaged");
+            let _ = fs::remove_dir_all(&damaged);
+            fs::create_dir_all(damaged.join("lod").join("x")).unwrap();
+            fs::copy(
+                root.join("skyrim_world.db"),
+                damaged.join("skyrim_world.db"),
+            )
+            .unwrap();
+            fs::copy(
+                root.join("lod-manifest.json"),
+                damaged.join("lod-manifest.json"),
+            )
+            .unwrap();
+            let target = damaged.join(&path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, bytes).unwrap();
+            assert!(crate::lod::objects::validate_object_lod_package(&damaged).is_err());
+        };
+
+        // A normal conversion of the same Data builds the chunks.
+        let mut full = config.clone();
+        full.output_dir = directory.path().join("full");
+        let report = run_without_progress(full).await;
+        check(&directory.path().join("full"), &report);
+
+        // A metadata rebuild of the pack that predates them builds the same chunks and reconverts
+        // no mesh or texture.
+        let mut rebuild = config.clone();
+        rebuild.output_dir = directory.path().join("rebuilt");
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let rebuilt =
+            AssetPipeline::rebuild_metadata_async(rebuild, &directory.path().join("before"), tx)
+                .await
+                .unwrap();
+        drain.await.unwrap();
+        check(&directory.path().join("rebuilt"), &rebuilt);
+        assert_eq!(rebuilt.converted, 0, "a rebuild reconverts nothing");
+    }
+
+    /// A missing atlas records the blocks it inspected, and the pipeline copies that coverage
+    /// into lod-manifest.json instead of dropping it.
+    #[tokio::test]
+    async fn a_missing_atlas_coverage_survives_the_pipeline_manifest() {
+        use crate::lod::retail::bto::tests::{SHAPE, nif_bytes, shape_block};
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        dummy_content::layout::prepare_directory(&data, false).unwrap();
+        dummy_content::layout::generate(
+            &data,
+            dummy_content::layout::DEFAULT_SEED,
+            dummy_content::layout::Formats::parse("dds,pex,nif,esm,lodsettings").unwrap(),
+        )
+        .unwrap();
+        let mut config = cpu_lod_config(&data, directory.path().join("before"));
+        config.cpu_jobs = 2;
+        let before = run_without_progress(config.clone()).await;
+        assert!(before.complete && before.lod_chunks > 0);
+        let (editor_id, x, y): (String, i32, i32) =
+            Connection::open(directory.path().join("before/skyrim_world.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT editor_id, lod_origin_x, lod_origin_y FROM worldspaces w \
+                     WHERE EXISTS(SELECT 1 FROM lod_chunks c WHERE c.worldspace_id = w.id) LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        let world = editor_id.to_ascii_lowercase();
+        let folder = data.join(format!("meshes/terrain/{world}/objects"));
+        fs::create_dir_all(&folder).unwrap();
+        let block = shape_block(
+            [x as f32 * 4096.0, y as f32 * 4096.0, 0.0],
+            16.0,
+            &[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+            &[[0, 1, 2]],
+            &[(0, 0, 1)],
+            true,
+            true,
+        );
+        fs::write(
+            folder.join(format!("{world}.16.{x}.{y}.bto")),
+            nif_bytes(&[(SHAPE, block)]),
+        )
+        .unwrap();
+
+        let mut missing = config;
+        missing.output_dir = directory.path().join("missing-atlas");
+        let report = run_without_progress(missing).await;
+        assert!(report.complete, "{:?}", report.warnings);
+        assert_eq!(report.object_lod_chunks, 0);
+        let manifest: LodManifest = serde_json::from_slice(
+            &fs::read(directory.path().join("missing-atlas/lod-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let reconciliation = manifest
+            .reconciliation
+            .as_ref()
+            .expect("the pipeline writes the reconciliation block");
+        assert_eq!(
+            reconciliation
+                .object_world_skips
+                .get(&world)
+                .map(String::as_str),
+            Some(crate::lod::object_stage::MISSING_ATLAS)
+        );
+        assert!(
+            reconciliation
+                .object_world_skip_blocks
+                .get(&world)
+                .is_some_and(|blocks| blocks.contains(&(16, x, y))),
+            "{:?}",
+            reconciliation.object_world_skip_blocks
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_conversion_keeps_verified_retail_terrain_when_a_block_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        let output = directory.path().join("output");
+        let staging = staging_path(&output);
+        dummy_content::layout::prepare_directory(&data, false).unwrap();
+        dummy_content::layout::generate(
+            &data,
+            dummy_content::layout::DEFAULT_SEED,
+            dummy_content::layout::Formats::parse("dds,esm,lodsettings").unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(staging.join("vfs")).unwrap();
+        overlay_loose_assets(&data, &staging.join("vfs"), &discover(&data).unwrap()).unwrap();
+        let plugins = vec![data.join("Skyrim.esm")];
+        let database = staging.join("skyrim_world.db");
+        let records = EsmParser::convert_plugins_with_records(&plugins, &database).unwrap();
+        write_cell_cache(&records, &staging.join("cell_cache.rkyv")).unwrap();
+        let (world_id, editor_id): (u32, String) = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT w.id, w.editor_id FROM worldspaces w JOIN cells c ON c.worldspace_id = w.id JOIN land l ON c.id = l.cell_id ORDER BY w.id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let origin = resolve_lod_settings(
+            &cpu_lod_config(&data, &output),
+            &staging.join("vfs"),
+            &editor_id,
+        )
+        .unwrap()
+        .unwrap()
+        .origin;
+        let world = editor_id.to_ascii_lowercase();
+        let mesh_dir = data.join("meshes/terrain").join(&world);
+        let texture_dir = data.join("textures/terrain").join(&world);
+        fs::create_dir_all(&mesh_dir).unwrap();
+        fs::create_dir_all(&texture_dir).unwrap();
+        let dds = |seed| {
+            dummy_content::dds::generate(
+                &dummy_content::dds::Spec::new(dummy_content::dds::Format::X8R8G8B8, 8, 8),
+                &mut dummy_content::rng::Rng::new(seed),
+            )
+            .unwrap()
+        };
+        let mut block_paths = Vec::new();
+        for anchor_x in 0..2 {
+            let x = origin.grid_x + anchor_x * 16;
+            let y = origin.grid_y;
+            let stem = format!("{world}.16.{x}.{y}");
+            let mesh = mesh_dir.join(format!("{stem}.btr"));
+            let colour = texture_dir.join(format!("{stem}.dds"));
+            fs::write(&mesh, crate::lod::retail::btr::tests::land_block()).unwrap();
+            fs::write(&colour, dds(5)).unwrap();
+            fs::write(texture_dir.join(format!("{stem}_n.dds")), dds(7)).unwrap();
+            let payload = shared::lod::chunk_payload_path(shared::lod::ChunkKey::new(
+                world_id,
+                shared::lod::LodTier::Tier16,
+                shared::lod::ChunkAnchor::new(anchor_x, 0),
+            ));
+            block_paths.push((mesh, colour, payload));
+        }
+        let [(damaged_mesh, _, retained), (_, new_colour, replaced)] = block_paths.as_slice()
+        else {
+            panic!("expected two fixture blocks");
+        };
+        let mut config = cpu_lod_config(&data, &output);
+        config.cpu_jobs = 2;
+        config.terrain_lod_source = crate::config::TerrainLodSource::Retail;
+        let (tx, _rx) = mpsc::channel(64);
+        let mut first = PipelineReport::default();
+        let hashes = vec![hash_file(&plugins[0]).unwrap()];
+        compile_lod_chunks(
+            &config, &staging, &output, &plugins, &hashes, &tx, &mut first, None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.lod_chunks, 2, "{:?}", first.lod_warnings);
+        let manifest_path = staging.join("lod-manifest.json");
+        let before: LodManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let before_retained = fs::read(staging.join(retained)).unwrap();
+        let before_replaced = hash_file(&staging.join(replaced)).unwrap();
+
+        // Model a stop after committing the world but before writing the final manifest.
+        fs::remove_file(manifest_path).unwrap();
+        fs::write(damaged_mesh, b"damaged terrain block").unwrap();
+        fs::write(new_colour, dds(9)).unwrap();
+        config.resume_staging = Some(staging);
+        let report = run_without_progress(config).await;
+        assert!(report.complete, "{:?}", report.warnings);
+        assert_eq!(report.lod_chunks, 2, "{:?}", report.lod_warnings);
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|line| line.contains("1 retail chunks kept"))
+        );
+        assert!(
+            report
+                .lod_warnings
+                .iter()
+                .any(|line| line.contains("unreadable_mesh"))
+        );
+
+        let after: LodManifest =
+            serde_json::from_slice(&fs::read(output.join("lod-manifest.json")).unwrap()).unwrap();
+        assert_eq!(after.retail_terrain_inputs.len(), 2);
+        assert_eq!(
+            before.retail_terrain_inputs[retained],
+            after.retail_terrain_inputs[retained]
+        );
+        assert_ne!(
+            before.retail_terrain_inputs[replaced],
+            after.retail_terrain_inputs[replaced]
+        );
+        assert_eq!(fs::read(output.join(retained)).unwrap(), before_retained);
+        assert_ne!(hash_file(&output.join(replaced)).unwrap(), before_replaced);
+        let database = Connection::open(output.join("skyrim_world.db")).unwrap();
+        for relative in [retained, replaced] {
+            let hash: String = database
+                .query_row(
+                    "SELECT content_hash FROM lod_chunks WHERE payload_path = ?1",
+                    [relative],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(hash, hash_file(&output.join(relative)).unwrap());
+        }
+        shared::world_assets::validate_lod_build_contract(&output, CONVERTER_SCHEMA_VERSION)
+            .unwrap();
+        assert!(!output.join(CHECKPOINT_DIR).exists());
+    }
+
+    /// A staged run that stopped in the LodChunks stage resumes and finishes when a world has
+    /// object blocks but no object atlas. The Creation Club atlas name is read in the same run.
+    #[tokio::test]
+    async fn a_resumed_conversion_skips_a_world_without_an_object_atlas_and_reads_the_lod_name() {
+        use crate::lod::retail::bto::tests::{SHAPE, nif_bytes, shape_block};
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        let output = directory.path().join("output");
+        let staging = staging_path(&output);
+        dummy_content::layout::prepare_directory(&data, false).unwrap();
+        dummy_content::layout::generate(
+            &data,
+            dummy_content::layout::DEFAULT_SEED,
+            dummy_content::layout::Formats::parse("dds,esm,lodsettings").unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(staging.join("vfs")).unwrap();
+        overlay_loose_assets(&data, &staging.join("vfs"), &discover(&data).unwrap()).unwrap();
+        let plugins = vec![data.join("Skyrim.esm")];
+        let database = staging.join("skyrim_world.db");
+        let records = EsmParser::convert_plugins_with_records(&plugins, &database).unwrap();
+        write_cell_cache(&records, &staging.join("cell_cache.rkyv")).unwrap();
+        let editor_id: String = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT w.editor_id FROM worldspaces w JOIN cells c ON c.worldspace_id = w.id JOIN land l ON c.id = l.cell_id ORDER BY w.id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let origin = resolve_lod_settings(
+            &cpu_lod_config(&data, &output),
+            &staging.join("vfs"),
+            &editor_id,
+        )
+        .unwrap()
+        .unwrap()
+        .origin;
+        let world = editor_id.to_ascii_lowercase();
+        let mesh_dir = data.join("meshes/terrain").join(&world);
+        let texture_dir = data.join("textures/terrain").join(&world);
+        let object_meshes = mesh_dir.join("objects");
+        let object_textures = texture_dir.join("objects");
+        for folder in [&mesh_dir, &texture_dir, &object_meshes, &object_textures] {
+            fs::create_dir_all(folder).unwrap();
+        }
+        let dds = |seed| {
+            dummy_content::dds::generate(
+                &dummy_content::dds::Spec::new(dummy_content::dds::Format::X8R8G8B8, 8, 8),
+                &mut dummy_content::rng::Rng::new(seed),
+            )
+            .unwrap()
+        };
+        let (x, y) = (origin.grid_x, origin.grid_y);
+        let stem = format!("{world}.16.{x}.{y}");
+        fs::write(
+            mesh_dir.join(format!("{stem}.btr")),
+            crate::lod::retail::btr::tests::land_block(),
+        )
+        .unwrap();
+        fs::write(texture_dir.join(format!("{stem}.dds")), dds(5)).unwrap();
+        fs::write(texture_dir.join(format!("{stem}_n.dds")), dds(7)).unwrap();
+        let block = shape_block(
+            [x as f32 * 4096.0, y as f32 * 4096.0, 0.0],
+            16.0,
+            &[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+            &[[0, 1, 2]],
+            &[(0, 0, 1)],
+            true,
+            true,
+        );
+        fs::write(
+            object_meshes.join(format!("{world}.16.{x}.{y}.bto")),
+            nif_bytes(&[(SHAPE, block)]),
+        )
+        .unwrap();
+        // The Creation Club name: no `<world>.objects.dds`.
+        let atlas = object_textures.join(format!("{world}objectslod.dds"));
+        fs::write(&atlas, dds(9)).unwrap();
+        fs::write(
+            object_textures.join(format!("{world}objectslod_n.dds")),
+            dds(10),
+        )
+        .unwrap();
+        let mut config = cpu_lod_config(&data, &output);
+        config.cpu_jobs = 2;
+        config.terrain_lod_source = crate::config::TerrainLodSource::Retail;
+
+        let (tx, _rx) = mpsc::channel(64);
+        let mut first = PipelineReport::default();
+        let hashes = vec![hash_file(&plugins[0]).unwrap()];
+        compile_lod_chunks(
+            &config, &staging, &output, &plugins, &hashes, &tx, &mut first, None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.object_lod_chunks, 1, "{:?}", first.lod_warnings);
+        assert!(first.lod_warnings.is_empty(), "{:?}", first.lod_warnings);
+
+        // The atlas is gone and the run stopped before the manifest was written. The resume
+        // rebuilds the LOD stages from the current inputs and skips the world.
+        fs::remove_file(&atlas).unwrap();
+        fs::remove_file(staging.join("lod-manifest.json")).unwrap();
+        config.resume_staging = Some(staging);
+        let report = run_without_progress(config).await;
+        assert!(report.complete, "{:?}", report.warnings);
+        assert_eq!(report.lod_chunks, 1, "{:?}", report.lod_warnings);
+        assert_eq!(report.object_lod_chunks, 0);
+        assert!(
+            report.lod_warnings.iter().any(|line| {
+                line.contains(&editor_id)
+                    && line.contains("world skipped: missing_atlas")
+                    && line.contains(&format!("{world}.objects.dds"))
+                    && line.contains(&format!("{world}objectslod.dds"))
+            }),
+            "{:?}",
+            report.lod_warnings
+        );
+        let manifest: LodManifest =
+            serde_json::from_slice(&fs::read(output.join("lod-manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest.object_chunks, 0);
+        assert!(manifest.object_atlases.is_empty());
+        assert!(manifest.object_normal_atlases.is_empty());
+        shared::world_assets::validate_lod_build_contract(&output, CONVERTER_SCHEMA_VERSION)
+            .unwrap();
     }
 
     #[tokio::test]
@@ -12418,6 +13237,56 @@ mod tests {
         assert!(!conversion_is_complete(&report));
     }
 
+    /// An intended omission (no usable value in the source) is a notice and a listed row. It does
+    /// not warn, so it cannot make the run incomplete (#811).
+    #[test]
+    fn intended_projection_omissions_are_listed_and_do_not_warn() {
+        use crate::esm::projection_omissions::{OmissionCategory, ProjectionOmissions, Severity};
+        assert_eq!(
+            OmissionCategory::LandMissingHeights.severity(),
+            Severity::Omitted
+        );
+        assert_eq!(
+            OmissionCategory::WorldspaceMissingEditorId.severity(),
+            Severity::Omitted
+        );
+        // Present-but-unreadable fields and missing links stay data loss.
+        for category in [
+            OmissionCategory::ReferenceMissingBase,
+            OmissionCategory::ReferenceShortScale,
+            OmissionCategory::ReferenceMissingCell,
+            OmissionCategory::ArmatureMissingRace,
+            OmissionCategory::RoomMarkerUnreadableFlags,
+        ] {
+            assert_eq!(
+                category.severity(),
+                Severity::DataLoss,
+                "{}",
+                category.name()
+            );
+        }
+        let mut omissions = ProjectionOmissions::default();
+        omissions.record(OmissionCategory::LandMissingHeights, 0x20, "no VHGT");
+        omissions.record(OmissionCategory::LandMissingHeights, 0x10, "no VHGT");
+        let mut report = PipelineReport::default();
+        report_projection_omissions(&mut report, &omissions);
+        assert!(report.warnings.is_empty());
+        assert_eq!(report.notices.len(), 1);
+        assert!(conversion_is_complete(&report));
+        assert_eq!(report.intended_omissions.len(), 1);
+        let row = &report.intended_omissions[0];
+        assert_eq!(
+            (
+                row.source.as_str(),
+                row.record_type.as_str(),
+                row.class.as_str(),
+                row.count
+            ),
+            ("world database", "LAND", "land_missing_heights", 2)
+        );
+        assert_eq!(row.first_example, "00000010: no VHGT");
+    }
+
     /// Notices never hide failures or affect completeness, regardless of insertion order.
     #[test]
     fn notices_do_not_affect_completeness() {
@@ -12770,7 +13639,7 @@ mod tests {
             dummy_content::nif::static_shape(&shape).unwrap(),
         )
         .unwrap();
-        let first = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        let first = run_without_progress(white_default_config(&data, &output)).await;
         assert!(first.complete, "{:?}", first.warnings);
         assert!(first.integration.as_ref().unwrap().passed);
         let mesh = output.join("meshes/architecture/deep.glb");
@@ -12818,7 +13687,7 @@ mod tests {
             .unwrap();
         fs::remove_file(output.join("grass_cache.rkyv")).unwrap();
 
-        let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        let report = run_without_progress(white_default_config(&data, &output)).await;
         assert!(
             report.cache_hits > 0,
             "the converted obstruction must be reused"
@@ -12960,7 +13829,7 @@ mod tests {
         for name in ["healthy", "fallback", "broken"] {
             fs::write(data.join(format!("meshes/architecture/{name}.nif")), &nif).unwrap();
         }
-        let first = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        let first = run_without_progress(white_default_config(&data, &output)).await;
         assert!(first.complete, "{:?}", first.warnings);
         assert!(first.integration.as_ref().unwrap().passed);
         let baseline = {
@@ -13036,7 +13905,7 @@ mod tests {
             .unwrap();
         fs::remove_file(output.join("grass_cache.rkyv")).unwrap();
 
-        let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        let report = run_without_progress(white_default_config(&data, &output)).await;
         assert!(
             report.cache_hits >= 3,
             "all three obstruction assets must be reused"
@@ -13173,7 +14042,7 @@ mod tests {
             ],
         ));
         fs::write(data.join("Grass.esp"), patch).unwrap();
-        let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        let report = run_without_progress(white_default_config(&data, &output)).await;
         assert!(!report.complete);
         assert!(
             report
@@ -13221,7 +14090,7 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(64);
             let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
             let report = AssetPipeline::rebuild_metadata_async(
-                PipelineConfig::new(data, output),
+                white_default_config(data, output),
                 source,
                 tx,
             )
@@ -13324,7 +14193,7 @@ mod tests {
         for name in ["healthy", "malformed"] {
             fs::write(data.join(format!("meshes/architecture/{name}.nif")), &nif).unwrap();
         }
-        let initial = run_without_progress(PipelineConfig::new(&data, &source)).await;
+        let initial = run_without_progress(white_default_config(&data, &source)).await;
         assert!(initial.complete, "{:?}", initial.warnings);
 
         // Keep readable bounds and a valid GLB container, but exceed the static sampler's depth.
@@ -13490,7 +14359,7 @@ mod tests {
             ],
         ));
         fs::write(data.join("Grass.esp"), patch).unwrap();
-        let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        let report = run_without_progress(white_default_config(&data, &output)).await;
         assert!(report.integration.as_ref().unwrap().passed);
         assert!(report.complete, "{:?}", report.warnings);
         assert!(
@@ -14517,6 +15386,28 @@ mod tests {
         assert_eq!(report.converted, entries as u64);
     }
 
+    #[test]
+    fn artifact_validation_accepts_a_published_linear_object_normal_atlas() {
+        let root = tempfile::tempdir().unwrap();
+        let relative = shared::lod::object_normal_atlas_path(1);
+        let path = root.path().join(&relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::X8R8G8B8, 4, 4),
+            &mut dummy_content::rng::Rng::new(0),
+        )
+        .unwrap();
+        let (published, _) =
+            crate::lod::objects::publish_object_normal_atlas(root.path(), 1, &dds).unwrap();
+        assert_eq!(published, relative);
+        let artifacts = [PathBuf::from(relative)];
+        validate_artifacts(root.path(), &artifacts, &BTreeMap::new(), 1).unwrap();
+
+        let srgb = TextureConverter::convert(&dds, TextureEncoding::ColorSrgb).unwrap();
+        fs::write(path, srgb).unwrap();
+        assert!(validate_artifacts(root.path(), &artifacts, &BTreeMap::new(), 1).is_err());
+    }
+
     /// The window between the last stage and the publish rename cannot be hit from outside in a
     /// test without racing the run, so the gate itself is driven directly: a run that was
     /// interrupted while it was packing up must not publish, and must keep its staging folder.
@@ -14690,6 +15581,8 @@ mod tests {
         fs::write(data.join("Grass.esp"), patch).unwrap();
         let mut config = cpu_lod_config(&data, &output);
         config.no_lod = true;
+        // These fixtures supply no landscape images: select the labelled white default.
+        config.terrain_default_texture = crate::config::TerrainDefaultTexture::White;
         let cold = run_without_progress(config.clone()).await;
         assert!(cold.complete, "{:?}", cold.warnings);
         let expected = read_cache(&output);
@@ -14765,6 +15658,8 @@ mod tests {
         let mut config = cpu_lod_config(&data, &output);
         config.record_reader = crate::config::RecordReader::Legacy;
         config.no_lod = true;
+        // These fixtures supply no landscape images: select the labelled white default.
+        config.terrain_default_texture = crate::config::TerrainDefaultTexture::White;
         let cold = run_without_progress(config.clone()).await;
         assert!(cold.complete && !cold.database_cache_hit);
         let grass = fs::read(output.join("grass_cache.rkyv")).unwrap();

@@ -7,8 +7,8 @@ use crate::{
         RecordConversion,
         cell_cache::validate_inhouse_land,
         exporter::{
-            create_tables, export_inhouse_record_archive_to_db, export_inhouse_to_db,
-            validate_inhouse_record,
+            RejectedLightFields, RejectedLightInputs, create_tables,
+            export_inhouse_record_archive_to_db, export_inhouse_to_db, validate_inhouse_record,
         },
         load_order::LoadOrder,
         records::RawRecord,
@@ -88,6 +88,8 @@ const DEFERRED_RUNTIME_TABLES: &[&str] = &[
     "worldspaces",
     "cells",
     "references",
+    "large_reference_omissions",
+    "large_references",
     "exterior_spatial",
     "land",
     "statics",
@@ -137,6 +139,7 @@ const DEFERRED_RUNTIME_TABLES: &[&str] = &[
     "reference_linked_refs",
     "reference_activate_parents",
     "reference_details",
+    "reference_light_data",
     "reference_authored_targets",
     "reference_authored_changes",
     "door_links",
@@ -1008,6 +1011,9 @@ fn convert_plugins_with_text_sources_report_impl(
         .map(|record| record.form_id)
         .collect::<BTreeSet<_>>();
     let mut opaque_fields = HashMap::new();
+    // Malformed FNAM/XRDS are rejected before export; remember them so the light status columns
+    // match the legacy reader's "malformed" instead of reading "absent".
+    let mut rejected_light_fields = RejectedLightFields::new();
     // Sort compact keys, leaving record payloads in place and streaming one JSON line at a time.
     // The same traversal fixes localized provenance rowids when no typed dump is requested.
     let mut record_keys = decoded
@@ -1153,6 +1159,13 @@ fn convert_plugins_with_text_sources_report_impl(
             records::typed_export::write_record(writer, record, &localization)?;
             writer.write_all(b"\n")?;
         }
+        let rejected_light = RejectedLightInputs {
+            fnam: record.rejected_fields.contains(b"FNAM"),
+            xrds: record.rejected_fields.contains(b"XRDS"),
+        };
+        if rejected_light != RejectedLightInputs::default() {
+            rejected_light_fields.insert(record.form_id, rejected_light);
+        }
         // Typed fields and the source digest have been written before ownership moves.
         let mut raw = take_canonical_record(record);
         // These indices still refer to the decoded field vector; apply translations
@@ -1279,6 +1292,7 @@ fn convert_plugins_with_text_sources_report_impl(
             plugin_paths,
             &unresolved_fields,
             &terrain_offsets,
+            Some(&rejected_light_fields),
             &decoded,
         )?;
     } else {
@@ -1455,6 +1469,12 @@ fn convert_plugins_with_text_sources_report_impl(
         .iter()
         .flat_map(|(name, diagnostics)| diagnostics.notice_summary_lines(name))
         .collect::<Vec<_>>();
+    let mut report_omissions = decoded
+        .diagnostics
+        .iter()
+        .flat_map(|(name, diagnostics)| diagnostics.intended_omission_rows(name))
+        .collect::<Vec<_>>();
+    crate::cache::merge_intended_omissions(&mut report_omissions);
     let release_stage = records::profile::ProfileStage::start("decoded_release");
     drop(decoded);
     release_stage.finish(master.len());
@@ -1470,6 +1490,7 @@ fn convert_plugins_with_text_sources_report_impl(
         records: master,
         warnings: report_warnings,
         notices: report_notices,
+        omissions: report_omissions,
     })
 }
 

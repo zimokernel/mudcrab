@@ -14,6 +14,7 @@ pub mod initial_enable;
 pub mod legacy_id_view;
 pub mod lod;
 pub mod model_visibility;
+pub mod nif_alpha;
 pub mod plugin_selection;
 pub mod plugin_table;
 pub mod records;
@@ -45,8 +46,20 @@ where
 /// Current combined database contract: corrected TXST roles and one-byte XESP flags.
 pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 9;
 
-/// Script ABI 4 packages the helper that searches active-state methods across the ancestry first.
-pub const PAPYRUS_SCRIPT_ABI_VERSION: u32 = 4;
+/// Current Papyrus script emission ABI: case-insensitive identifiers and permissive initial states.
+///
+/// 4: the shared `papyrus_runtime.luau` gained the helper that searches active-state methods across
+/// the ancestry first (#764). Emitted scripts are unchanged; the runtime is part of the ABI because
+/// the converter copies it into each pack and hashes it. Raising the number makes `--reuse-assets`
+/// rebuild only the scripts and rewrite the runtime copy.
+///
+/// 5: the same runtime gained inherited-native lookup, fault-and-continue, a scheduler and
+/// per-frame budgets (#703). Both changes reach packs through the same file, so ABI 4 packs made
+/// on either side must rebuild their script kind.
+///
+/// Existing packs still load: the engine never reads a pack's ABI or its runtime copy. It runs
+/// scripts only with `--papyrus-scripts`, and then uses its built-in runtime.
+pub const PAPYRUS_SCRIPT_ABI_VERSION: u32 = 5;
 /// Latest producer required when a package advertises the combined LOD contract.
 /// 27: collision coverage (sphere shapes as zero-length capsules, multi-sphere and cylinder
 /// shapes) changes GLB collision extras.

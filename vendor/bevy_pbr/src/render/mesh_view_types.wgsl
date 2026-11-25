@@ -23,6 +23,8 @@ const POINT_LIGHT_FLAGS_VOLUMETRIC_BIT: u32                         = 1u << 2u;
 const POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT: u32   = 1u << 3u;
 const POINT_LIGHT_FLAGS_CONTACT_SHADOWS_ENABLED_BIT: u32            = 1u << 4u;
 const POINT_LIGHT_FLAGS_SPOT_LIGHT_BIT: u32                         = 1u << 5u;
+// mudcrab: retail point-light falloff, `1 - saturate(d / range)^2`, see `RetailPointFalloff`.
+const POINT_LIGHT_FLAGS_RETAIL_FALLOFF_BIT: u32                     = 1u << 6u;
 
 struct DirectionalCascade {
     clip_from_world: mat4x4<f32>,
@@ -98,6 +100,9 @@ struct Fog {
     // For Atmospheric Fog:
     //     be = per-channel extinction density
     //     bi = per-channel inscattering density
+    // For Power Ramp Fog (mudcrab):
+    //     be.x = start, be.y = end, be.z = power
+    //     bi = near colour (linear RGB)
     be: vec3<f32>,
     directional_light_exponent: f32,
     bi: vec3<f32>,
@@ -110,6 +115,8 @@ const FOG_MODE_LINEAR: u32                = 1u;
 const FOG_MODE_EXPONENTIAL: u32           = 2u;
 const FOG_MODE_EXPONENTIAL_SQUARED: u32   = 3u;
 const FOG_MODE_ATMOSPHERIC: u32           = 4u;
+// mudcrab: the power ramp mode of the weather's exterior fog (#891).
+const FOG_MODE_POWER_RAMP: u32            = 5u;
 
 #if AVAILABLE_STORAGE_BUFFER_BINDINGS >= 3
 struct ClusteredLights {

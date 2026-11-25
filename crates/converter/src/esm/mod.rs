@@ -25,6 +25,7 @@ pub mod grass_cache;
 pub mod inhouse;
 mod inhouse_script_properties;
 mod inhouse_terrain_diagnostics;
+pub(crate) mod large_references;
 mod legacy_text;
 pub mod load_order;
 pub mod lodsettings;
@@ -70,11 +71,14 @@ pub(crate) struct RecordConversion {
     pub(crate) records: HashMap<u32, RawRecord>,
     pub(crate) warnings: Vec<String>,
     pub(crate) notices: Vec<String>,
+    /// Records omitted on purpose because they have no usable value. Not failures (#811).
+    pub(crate) omissions: Vec<crate::cache::IntendedOmission>,
     /// In-house stage seconds for the database profile; legacy exports record none.
     pub(crate) phases: std::collections::BTreeMap<String, f64>,
 }
 
 struct LegacyPluginMerge {
+    large_references: large_references::LargeReferences,
     deleted_ids: HashSet<u32>,
     conversion: RecordConversion,
     damaged_cells: HashSet<u32>,
@@ -356,8 +360,10 @@ impl EsmParser {
         let mut damaged_cells = HashSet::new();
         let mut unknown_discarded_scope = false;
         let mut room_link_layouts = HashMap::new();
+        let mut large_references = large_references::LargeReferences::default();
         let mut placement_candidates = BTreeMap::new();
         let mut deleted_ids = crate::records::DeletedBases::default();
+        let mut unproven_deletions = HashSet::new();
         let mut summaries = Vec::new();
         // Unlike ordinary forms, game settings override by EditorID. Retain
         // the first definition's key/owner while taking the last setting value.
@@ -465,7 +471,7 @@ impl EsmParser {
                 };
                 if let Err(error) = admission {
                     reject_placement(&mut damaged_placements);
-                    warnings.skipped_record(
+                    warnings.rejected_record(
                         &order.names[priority],
                         &record,
                         source_id,
@@ -531,11 +537,27 @@ impl EsmParser {
                 }
                 sources.insert(remapped_source_id, (source_id, out_of_range));
                 let id = record.form_id;
+                if record.record_type == *b"WRLD" && !record.is_deleted() {
+                    large_references.collect(&record, source_id, priority, order);
+                }
                 let previous_layout = room_link_layouts.remove(&id);
                 if let Some(layout) = room_link_layout {
                     room_link_layouts.insert(id, layout);
                 }
                 if record.is_deleted() {
+                    // Legacy remapping can admit a compatibility alias that is too weak to
+                    // establish a confirmed removal for RNAM.
+                    if crate::records::source_identity::header_runtime_id(
+                        &record.record_type,
+                        source_id,
+                        priority,
+                        order,
+                    ) == Some(id)
+                    {
+                        unproven_deletions.remove(&id);
+                    } else {
+                        unproven_deletions.insert(id);
+                    }
                     let prior_kind = settle_legacy_predecessor(
                         id,
                         placement_candidates.get(&id),
@@ -605,16 +627,27 @@ impl EsmParser {
             order,
             &warnings,
         );
+        let omissions = warnings.omissions();
         let (remap_warnings, notices) = warnings.report();
         summaries.extend(remap_warnings);
         damaged_placements.unknown_scope |= unknown_discarded_scope;
+        large_references.confirm_removed(|id| {
+            !merged.contains_key(&id)
+                && !unproven_deletions.contains(&id)
+                && !damaged_placements
+                    .cells_by_reference
+                    .contains_key(&Some(id))
+                && deleted_ids.is_unrestored_reference(id)
+        });
         damaged_cells.extend(damaged_placements.affected_cells(&merged));
         Ok(LegacyPluginMerge {
+            large_references,
             deleted_ids: deleted_ids.absent_from(&merged),
             conversion: RecordConversion {
                 records: merged,
                 warnings: summaries,
                 notices,
+                omissions,
                 phases: BTreeMap::new(),
             },
             damaged_cells,
@@ -1018,6 +1051,9 @@ pub(crate) fn merge_default_objects(previous: &RawRecord, record: &mut RawRecord
 /// Per-plugin count of out-of-range master indices, with the first ID and its record type.
 type OutOfRangeCounts = BTreeMap<String, (u64, u32, [u8; 4])>;
 
+/// Intended omissions keyed by plugin, record type and reason class: count and first example.
+type OmittedRecords = BTreeMap<(String, String, &'static str), (u64, String)>;
+
 /// Remap diagnostics counted per plugin (including references), each keeping its first
 /// example, so memory and log volume scale with plugins, not records.
 #[derive(Default)]
@@ -1033,6 +1069,9 @@ struct RemapWarnings {
     retired_base_placements: RefCell<BTreeMap<String, (u64, u32, u32)>>,
     /// Unusable candidates never replace an earlier complete record.
     skipped_records: RefCell<BTreeMap<String, (u64, String)>>,
+    /// Intended omissions (#811): records with no usable value, by plugin, record type and
+    /// reason class. Counted apart from `skipped_records`, so they never warn.
+    omitted_records: RefCell<OmittedRecords>,
 }
 
 impl RemapWarnings {
@@ -1057,6 +1096,47 @@ impl RemapWarnings {
         let mut counts = self.skipped_optional.borrow_mut();
         let entry = counts.entry(plugin.to_owned()).or_insert((0, example));
         entry.0 += 1;
+    }
+
+    /// Count a rejection as an intended omission when its reason is one, else as a skipped
+    /// record. A malformed authored field is never an intended omission.
+    fn rejected_record(&self, plugin: &str, record: &RawRecord, source_id: u32, reason: String) {
+        let Some(class) = crate::records::intended_omission_class(&reason) else {
+            return self.skipped_record(plugin, record, source_id, reason);
+        };
+        let example = format!(
+            "{} {:08X}: unusable runtime candidate: {reason}",
+            String::from_utf8_lossy(&record.record_type),
+            record.form_id
+        );
+        let key = (
+            plugin.to_owned(),
+            String::from_utf8_lossy(&record.record_type).into_owned(),
+            class,
+        );
+        let mut counts = self.omitted_records.borrow_mut();
+        let entry = counts.entry(key).or_insert_with(|| (0, example.clone()));
+        entry.0 += 1;
+        if example < entry.1 {
+            entry.1 = example;
+        }
+    }
+
+    /// The intended omissions as manifest rows, in plugin, record type and class order.
+    fn omissions(&self) -> Vec<crate::cache::IntendedOmission> {
+        self.omitted_records
+            .borrow()
+            .iter()
+            .map(|((plugin, record_type, class), (count, example))| {
+                crate::cache::IntendedOmission {
+                    source: plugin.clone(),
+                    record_type: record_type.clone(),
+                    class: (*class).to_owned(),
+                    count: *count,
+                    first_example: example.clone(),
+                }
+            })
+            .collect()
     }
 
     fn skipped_record(&self, plugin: &str, record: &RawRecord, source_id: u32, reason: String) {
@@ -1111,6 +1191,11 @@ impl RemapWarnings {
             let summary = format!(
                 "notice: {plugin}: omitted {count} placement candidate(s) whose base was deleted by a later plugin (first: {id:08X}, required NAME {base:08X})"
             );
+            eprintln!("{summary}");
+            notice_lines.push(summary);
+        }
+        for row in self.omissions() {
+            let summary = row.notice();
             eprintln!("{summary}");
             notice_lines.push(summary);
         }

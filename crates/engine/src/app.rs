@@ -110,11 +110,7 @@ fn prepare_start_camera(
         config.worldspace_id = worldspace;
     }
     if let Some((settings, settings_file)) = preferences {
-        settings_file.apply_start_shot(
-            settings,
-            crate::shots::vertical_fov_degrees(file.shots[0].hfov, file.aspect()),
-            (file.width, file.height),
-        );
+        settings_file.apply_start_shot(settings, file.shots[0].hfov, (file.width, file.height));
     }
     Ok(Some(InitialWorldCameraPose {
         shot: file.shots[0].clone(),
@@ -365,8 +361,47 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let terrain_merge = runtime_data
         .is_some()
         .then(|| crate::terrain_merge::TerrainMerge::open(&config.assets_dir));
-    let grade_source =
+    let mut grade_source =
         SceneGradeSource::load(&config, runtime_data.is_some() && !config.streaming_fixture)?;
+    // The sky and fog come from the active weather record (#891). A fixture run has no world
+    // database and keeps the built-in `SkyrimClear` palette.
+    let weather_note = match environment
+        .as_ref()
+        .filter(|_| runtime_data.is_some() && !config.streaming_fixture)
+    {
+        Some(catalog) => {
+            match crate::weather_sky::WeatherSky::default_for_world(catalog, config.worldspace_id) {
+                Ok(weather) => {
+                    if !weather.fog_omissions.is_empty() {
+                        eprintln!(
+                            "warning: weather {}: the record has no {}; the exterior draws no fog",
+                            weather.label(),
+                            weather.fog_omissions.join(", ")
+                        );
+                    }
+                    let note = format!("weather {}: sky and fog from the record", weather.label());
+                    grade_source.weather = Some(weather);
+                    note
+                }
+                // `skyrim` takes sky and fog from weather records, so it cannot start without one.
+                Err(error)
+                    if config.visual_profile == crate::visual_profile::VisualProfile::Skyrim =>
+                {
+                    return Err(color_eyre::eyre::eyre!(
+                        "--visual-profile skyrim takes its sky and fog from a weather record: {error}"
+                    ));
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: weather: {error}; the {} look's built-in sky and fog stand in",
+                        config.visual_preset.name()
+                    );
+                    "no weather record: built-in preset sky and fog".to_owned()
+                }
+            }
+        }
+        None => "no world database: built-in preset sky and fog".to_owned(),
+    };
     let mut tone_map_source = SceneToneMapSource::load(&config, &grade_source)?;
     if let Some((settings, _)) = preferences.as_mut() {
         tone_map_source.bevy_tonemapping = crate::settings::TONE_MAPS[settings.tone_map];
@@ -383,7 +418,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             settings.show_resolved_grade(resolved.grade, resolved.post.pivot);
         }
     }
-    let sky_palette = grade_source.sky_palette(config.visual_preset);
+    let sky_palette = grade_source.sky_palette(config.visual_preset, config.game_hour);
     let movement_tuning = (interactive_world_physics
         && runtime_data.is_some()
         && !config.streaming_fixture)
@@ -547,7 +582,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // the main world, and it changes nothing else about the frame.
         .add_plugins(crate::swap_bridge::SwapBridgePlugin)
         // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
-        // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
+        // and the lights setting (on unless `--no-lights`) is what `streaming::spawn_cell` reads to place anything for it to budget.
         .add_plugins(crate::lights::LightsPlugin)
         .add_plugins(crate::actor_animation::ActorAnimationPlugin)
         .add_plugins(crate::actor_drive::ActorDrivePlugin)
@@ -585,6 +620,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         },
         "visual profile active; changing it requires a restart"
     );
+    info!(weather = %weather_note, "exterior sky and fog source");
     if app
         .world()
         .resource::<EngineConfig>()
@@ -633,6 +669,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         app.add_systems(Startup, setup_world);
         if interactive_world_physics {
             app.add_plugins((WorldPlayerPlugin, crate::door_crossing::DoorCrossingPlugin));
+            if app.world().resource::<EngineConfig>().papyrus_scripts {
+                app.add_plugins(crate::papyrus_plugin::PapyrusScriptsPlugin);
+            }
             // `coc`/`coe` move the player, so they come with it, as `tcl` does: a run without a
             // player (a benchmark, `--shots`, headless) lists neither in Help.
             crate::cell_commands::register_cell_commands(&mut app);
@@ -696,8 +735,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // `RenderPlugin` only `init_resource`s its default handler, so this one wins wherever it is
     // inserted.
     app.insert_resource(RenderErrorHandler(handle_render_error));
+    let missing_nif_alpha = app
+        .world()
+        .resource::<crate::nif_material::MissingNifAlphaData>()
+        .clone();
     let exit = app.run();
     drop(app);
+    missing_nif_alpha.report();
     drop(streaming_fixture_dir);
     finished(&exit)
 }
@@ -840,6 +884,14 @@ fn world_gltf_plugin() -> bevy::gltf::GltfPlugin {
         default_sampler: terrain_layer_sampler(),
         ..default()
     }
+    .add_custom_vertex_attribute(
+        "OBJECT_ATLAS_RED",
+        crate::streaming::lod_object_material::RED_AXIS,
+    )
+    .add_custom_vertex_attribute(
+        "OBJECT_ATLAS_GREEN",
+        crate::streaming::lod_object_material::GREEN_AXIS,
+    )
 }
 
 /// Reads the `--shots` file, if one was given, and points the run at its first exterior pose: that
@@ -2446,17 +2498,9 @@ fn setup_synthetic_benchmark(
 /// is this many times larger here.
 const CREATION_UNITS_PER_METRE: f32 = 70.0;
 
-/// The number of cascades the sun's shadow map is split into. Four is Bevy's default and its
-/// per-light maximum on desktop (`MAX_CASCADES_PER_LIGHT`, `bevy_pbr-0.19.0`
-/// `src/render/light.rs:228`), and with [`sun_shadow_cascades`] reaching the far corner of the
-/// drawn grid, fewer would mean larger cascades and coarser shadows everywhere the player looks.
-const SUN_SHADOW_CASCADES: usize = 4;
-
-/// The size of each of the sun's cascades, in texels a side. This is Bevy's own default, which
-/// `DirectionalLightShadowMap` documents as having to be a power of two, and it is stated here
-/// rather than left implicit so that the resolution the sun's shadows are drawn at is this
-/// engine's decision instead of a Bevy default that can move under it.
-const SUN_SHADOW_MAP_SIZE: usize = 2048;
+/// The widest cascade count Bevy supports for one light (`MAX_CASCADES_PER_LIGHT`,
+/// `bevy_pbr-0.19.0` `src/render/light.rs:228`).
+const MAX_SUN_SHADOW_CASCADES: usize = 4;
 
 /// The most cells, from the camera's cell to the far edge of the drawn grid, that
 /// [`sun_shadow_cascades`] fits the sun's shadow range to. `--stream-radius` accepts any integer,
@@ -2477,66 +2521,120 @@ const SUN_SHADOW_MAX_GRID_CELLS: i32 = 256;
 /// metres of ground around the camera, with every house, tree and cell of the streamed world
 /// outside the last cascade - the sun lights the scene and none of it falls in shadow.
 ///
-/// # The distances
+/// # The defaults (#949, #857)
 ///
-/// The first two are Bevy's defaults read in metres and converted at [`CREATION_UNITS_PER_METRE`]:
-/// a first cascade far bound of 10 m (700 units), and a near clamp of 0.1 m (7 units) below which
-/// no shadow is drawn, which is the same 10 cm Bevy's default works at. The overlap between
-/// cascades is left at the builder's default; only the distances are fitted to this world.
+/// Retail's count is `iNumSplits=2`, its range is `[Display] fShadowDistance`, its map is
+/// `iShadowMapResolution`, and its split starts from `fFirstSliceDistance`. The Mudcrab defaults
+/// are in `config.rs`: 2 cascades, 10000 units (`Ultra.ini`), 4096 texels (`Ultra.ini`) and a
+/// first slice of 2000 (`Skyrim_Default.ini`). The far bounds come from the retail split
+/// ([`retail_cascade_bounds`]), not from Bevy's geometric split.
 ///
-/// [`maximum_distance`] starts as a property of the drawn world:
+/// # The range
+///
+/// The range starts as a property of the drawn world:
 /// `streaming::plan_cells` requests `config.stream_radius` cells around the camera's cell and keeps
 /// them until they leave `config.unload_radius`, which the command line sets one ring wider, so
 /// cells - and the geometry they carry - keep drawing out to the unload ring rather than to the
 /// requested radius. The camera stands somewhere inside its own cell, so that grid is at most
 /// `unload_radius + 1` cells from it to the edge and [sqrt(2)] times that to the far corner, and
-/// the range is the distance from the camera to that corner, the camera being [`camera_offset`]
-/// above the point it looks at. `[Display] fShadowDistance` may cap that range to match Skyrim's
-/// configured exterior shadow draw distance. Without that INI key it stops at the drawn grid:
+/// the grid range is the distance from the camera to that corner, the camera being
+/// [`camera_offset`] above the point it looks at. `[Display] fShadowDistance` caps that range, as
+/// it caps retail's. Where the grid is smaller than the distance, it stops at the drawn grid:
 /// nothing is drawn past the corner, so a wider range would only spend the same shadow map on
 /// coarser cascades. Terrain standing above the ground plane at the corner is further from the
 /// camera than the corner and is not accounted for.
 /// [SUN_SHADOW_MAX_GRID_CELLS] caps the fit for radii the command line accepts but nothing could
-/// stream. At the default `unload_radius` of 3 the last bound is about 23,200 units, a third of a
-/// kilometre.
+/// stream. At the default `unload_radius` of 3 the grid range is about 23,200 units, so the
+/// default 10000-unit distance is the limit.
 ///
 /// # The cost
 ///
-/// This is the first configuration in which the shadow pass draws the streamed world rather than a
-/// patch of ground in front of the camera: it draws the union of the cascades, which is the
-/// camera's view out to `maximum_distance`, so it draws on the order of what the main pass draws
-/// again. A frame rate that suffers is turned back up by, in order of how much they give,
-/// `maximum_distance`, which is the geometry the pass draws at all, [`SUN_SHADOW_CASCADES`], which
-/// is how many passes it is split over, and [`SUN_SHADOW_MAP_SIZE`], which is fill rate rather than
-/// geometry. The biases are left at Bevy's defaults. Measure that cost rather than assume it: the
-/// synthetic scenario (`scripts/phase2-profile.ps1 -Scenario synthetic`) runs this setup without
-/// game data, and `docs/roadmap/02-profiling.md` holds the campaign and its regression thresholds.
+/// The shadow pass draws the union of the cascades, which is the camera's view out to the range, so
+/// it draws on the order of what the main pass draws again. A frame rate that suffers is turned back
+/// up by, in order of how much they give, the range, the cascade count, and the map size, which is
+/// fill rate rather than geometry. The biases are left at Bevy's defaults. Measure that cost rather
+/// than assume it: the synthetic scenario (`scripts/phase2-profile.ps1 -Scenario synthetic`) runs
+/// this setup without game data, and `docs/roadmap/02-profiling.md` holds the campaign and its
+/// regression thresholds.
 ///
 /// [sqrt(2)]: std::f32::consts::SQRT_2
-/// [`maximum_distance`]: CascadeShadowConfigBuilder::maximum_distance
 pub(crate) fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
+    sun_shadow_cascades_for(config, config.sun_shadow_cascades, 1.0)
+}
+
+/// [`sun_shadow_cascades`] with an explicit cascade count and a multiplier on the whole range, as
+/// the settings menu's "Sun shadow cascades" and "Sun shadow-distance multiplier" give them. The
+/// count is clamped to 1 through [`MAX_SUN_SHADOW_CASCADES`].
+pub(crate) fn sun_shadow_cascades_for(
+    config: &EngineConfig,
+    cascades: usize,
+    distance_scale: f32,
+) -> CascadeShadowConfig {
     // Cells draw out to `unload_radius`, one ring past the requested `stream_radius`, and the
     // `+ 1` is the camera's own cell: the grid is `unload_radius` cells around that cell rather
     // than around the camera, which may stand at the far edge of its own. The radius is clamped
     // at both ends: a negative one, which the command line allows, streams nothing and the range
-    // derived from it would fall under the first cascade's far bound, which
-    // `CascadeShadowConfigBuilder::build` rejects by panic, while one past
+    // derived from it would fall under the first cascade's near distance, while one past
     // [SUN_SHADOW_MAX_GRID_CELLS] is more grid than the shadow map can usefully cover.
     let unload_cells = config.unload_radius.saturating_add(1);
     let cells = unload_cells.clamp(1, SUN_SHADOW_MAX_GRID_CELLS);
     let corner = crate::world::components::CELL_SIZE * cells as f32 * std::f32::consts::SQRT_2;
     let grid_distance = corner.hypot(camera_offset(config).y);
-    let maximum_distance = config
-        .sun_shadow_distance_limit
-        .map_or(grid_distance, |limit| grid_distance.min(limit));
-    CascadeShadowConfigBuilder {
+    // `D` of the retail split: the exterior shadow distance, or the grid where code sets none.
+    let nominal = config.sun_shadow_distance_limit.unwrap_or(grid_distance);
+    let range = grid_distance.min(nominal);
+    let scaled_range = range * distance_scale;
+    CascadeShadowConfig {
+        bounds: retail_cascade_bounds(
+            cascades.clamp(1, MAX_SUN_SHADOW_CASCADES),
+            config.sun_first_slice_distance,
+            nominal * distance_scale,
+            scaled_range,
+            // A Mudcrab-only cap, to keep the bounds increasing: the split needs the near
+            // distance below the range, and `fNearDistance` accepts up to 1000.
+            config.near_distance.min(scaled_range * 0.5),
+        ),
+        // The overlap stays at Bevy's default. Retail's `fSplitOverlap=100` is in units; its
+        // fraction for this layout is not derived yet (#949 audit row 8).
+        overlap_proportion: CascadeShadowConfigBuilder::default().overlap_proportion,
         minimum_distance: 0.1 * CREATION_UNITS_PER_METRE,
-        maximum_distance,
-        first_cascade_far_bound: (10.0 * CREATION_UNITS_PER_METRE).min(maximum_distance * 0.5),
-        num_cascades: SUN_SHADOW_CASCADES,
-        ..default()
     }
-    .into()
+}
+
+/// The far bound of each sun shadow cascade, from retail's split (verified by static reading of
+/// 1.7.104, high confidence; skyrim_decomp PR 806, section 2,
+/// <https://github.com/Mudcrab-Team/skyrim_decomp/pull/806>).
+///
+/// `count` is `N` (`iNumSplits`), `first_slice` is `fFirstSliceDistance`, `distance` is `D`
+/// (`fShadowDistance`), `range` is `F` (the farthest distance shadowed) and `near` is `n`, the
+/// camera near distance (`EngineConfig::near_distance`, `[Display] fNearDistance`). The
+/// split fraction is `t0 = min(D / N, max(first_slice, 500)) / D`, and for `N >= 2`
+/// `t_i = t0 + (1 - t0) * i / (N - 1)`. The far bound is
+/// `E_i = 0.5 * (n * (F / n)^t_i + n + (F - n) * t_i)`, an even mix of a geometric and a linear
+/// split. The last bound is `F`. Retail adds `fSplitOverlap` to each bound; Mudcrab uses Bevy's
+/// `overlap_proportion` instead, since the units-to-fraction derivation is open (row 8).
+///
+/// `fFirstSliceDistance` is therefore not the first cascade's end: with `D = 10000`, a first slice
+/// of 2000 and `n = 15`, the first bound is about 1030 units. One cascade reaches `range` (retail
+/// does not trace that case).
+fn retail_cascade_bounds(
+    count: usize,
+    first_slice: f32,
+    distance: f32,
+    range: f32,
+    near: f32,
+) -> Vec<f32> {
+    if count <= 1 {
+        return vec![range];
+    }
+    let n = count as f32;
+    let t0 = (distance / n).min(first_slice.max(500.0)) / distance;
+    (0..count)
+        .map(|i| {
+            let t = t0 + (1.0 - t0) * i as f32 / (n - 1.0);
+            0.5 * (near * (range / near).powf(t) + near + (range - near) * t)
+        })
+        .collect()
 }
 
 /// Rotate toward the evaluated sun unless an explicit Creation bearing/elevation overrides it.
@@ -2610,7 +2708,13 @@ fn setup_world(
     } else {
         Transform::from_translation(camera_position).looking_at(target, Vec3::Y)
     };
-    let mut perspective = PerspectiveProjection { far, ..default() };
+    // The near plane is retail's `fNearDistance` (#949). The vertical angle is set once the
+    // window's aspect ratio is known, by `settings::apply_render_settings` (#904).
+    let mut perspective = PerspectiveProjection {
+        far,
+        near: config.near_distance,
+        ..default()
+    };
     if let Some(pose) = start_camera {
         camera_transform.translation = crate::shots::shot_camera_translation(
             pose.shot.position,
@@ -2627,7 +2731,7 @@ fn setup_world(
         Projection::Perspective(perspective),
         camera_transform,
         StreamingCamera,
-        crate::room_culling::RoomCullingNear::SKYRIM,
+        crate::room_culling::RoomCullingNear::new(config.near_distance),
         IsDefaultUiCamera,
         // This camera draws the streamed world, so the weather's distance fog covers it.
         FogCamera,
@@ -2649,7 +2753,7 @@ fn setup_world(
     // whose unit is 1.43 cm, and a shadow map spent on that patch is a world lit flat
     // (`sun_shadow_cascades`).
     commands.insert_resource(DirectionalLightShadowMap {
-        size: SUN_SHADOW_MAP_SIZE,
+        size: config.sun_shadow_map_size,
     });
     // The sun and ambient colours are the clear weather's own (`WTHR` 0x81A, day). Their levels are
     // the configured input ratio in `crate::lights::AMBIENT_ILLUMINANCE` (a simplified heuristic,
@@ -4858,37 +4962,135 @@ mod tests {
             Some(&render)
         ));
     }
-    /// The sun's shadows reach the grid the streamer draws, whichever way the camera faces, and the
-    /// shader's view of them is usable: far bounds that increase (the shader takes the first bound a
-    /// fragment is inside, so a bound out of order hands everything beyond it to a cascade that
-    /// cannot see it) and a near clamp below the first far bound. The two near distances are Bevy's
-    /// defaults read in metres; the last is this engine's drawn grid.
+    /// A configuration whose sun shadow range is the drawn grid, with no `fShadowDistance` cap.
+    fn grid_fitted(config: EngineConfig) -> EngineConfig {
+        EngineConfig {
+            sun_shadow_distance_limit: None,
+            ..config
+        }
+    }
+
+    /// The default sun shadows are retail's: two cascades out to Ultra's 10000 units, with the
+    /// first far bound from the retail split rather than the first slice distance itself. The
+    /// far bounds are usable for the shader, which takes the first bound a fragment is inside, so
+    /// a bound out of order hands everything beyond it to a cascade that cannot see it.
     #[test]
-    fn the_sun_shadows_cover_the_drawn_grid() {
+    fn the_default_sun_shadows_are_retails_two_cascades_to_ultras_distance() {
         let config = EngineConfig::default();
         let cascades = sun_shadow_cascades(&config);
-        let cell = crate::world::components::CELL_SIZE;
-        assert_eq!(config.stream_radius, 2);
-        // Cells are requested inside the stream radius and kept until they leave the unload ring,
-        // one wider, so the unload ring is the grid that keeps drawing.
-        assert_eq!(config.unload_radius, 3);
-        assert_eq!(cascades.bounds.len(), SUN_SHADOW_CASCADES);
-
+        assert_eq!(cascades.bounds.len(), 2, "iNumSplits");
+        assert!(
+            (cascades.bounds[1] - 10_000.0).abs() < 0.01,
+            "fShadowDistance from Ultra.ini: {:?}",
+            cascades.bounds
+        );
+        // t0 = min(10000 / 2, max(2000, 500)) / 10000 = 0.2;
+        // E_0 = 0.5 * (15 * (10000 / 15)^0.2 + 15 + 9985 * 0.2) = 1033.5 (retail, without overlap).
+        let expected = 0.5 * (15.0 * (10_000.0_f32 / 15.0).powf(0.2) + 15.0 + 9_985.0 * 0.2);
+        assert!(
+            (cascades.bounds[0] - expected).abs() < 0.01,
+            "the first far bound is {} against the retail split's {expected}",
+            cascades.bounds[0]
+        );
+        assert!((cascades.bounds[0] - 1_033.5).abs() < 0.5);
         assert_eq!(
             cascades.minimum_distance,
             0.1 * CREATION_UNITS_PER_METRE,
             "Bevy's 10 cm near clamp, in Creation units"
         );
         assert_eq!(
-            cascades.bounds[0],
-            10.0 * CREATION_UNITS_PER_METRE,
-            "and its 10 m first cascade, which is 700 units here"
-        );
-        assert_eq!(
             cascades.overlap_proportion,
             CascadeShadowConfigBuilder::default().overlap_proportion,
-            "the cascade overlap is the builder's default, not a number of this engine's"
+            "the cascade overlap is the builder's default until retail's is derived (row 8)"
         );
+        assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(cascades.minimum_distance < cascades.bounds[0]);
+    }
+
+    /// The split's near distance is the camera's (`fNearDistance`), so an INI value moves the first
+    /// bound and not the last, and a large one cannot make the bounds decrease.
+    #[test]
+    fn an_ini_near_distance_moves_the_first_cascade_bound() {
+        let with_near = |near: &str, distance: &str| {
+            let mut ini = crate::skyrim_ini::SkyrimIni::default();
+            ini.merge_str(&format!(
+                "[Display]\nfNearDistance={near}\nfShadowDistance={distance}\n"
+            ));
+            let mut config = EngineConfig::default();
+            ini.apply(&mut config);
+            sun_shadow_cascades(&config).bounds
+        };
+        let default = sun_shadow_cascades(&EngineConfig::default()).bounds;
+        let moved = with_near("200", "10000");
+        assert_eq!(with_near("15", "10000"), default, "15 is the default");
+        assert!(moved[0] > default[0], "{moved:?} against {default:?}");
+        assert_eq!(moved[1], default[1], "the range does not move");
+        // E_0 = 0.5 * (200 * (10000 / 200)^0.2 + 200 + 9800 * 0.2), by hand.
+        let expected = 0.5 * (200.0 * (10_000.0_f32 / 200.0).powf(0.2) + 200.0 + 9_800.0 * 0.2);
+        assert!(
+            (moved[0] - expected).abs() < 0.01,
+            "{} against {expected}",
+            moved[0]
+        );
+        // The largest accepted near distance on the shortest accepted range still gives increasing
+        // bounds, because the split caps the near distance at half the range.
+        let extreme = with_near("1000", "700");
+        assert!(
+            extreme.windows(2).all(|pair| pair[0] < pair[1]),
+            "{extreme:?}"
+        );
+        assert!(extreme[0] > 7.0, "{extreme:?}");
+    }
+
+    /// The first slice distance feeds the retail split as its first fraction, floored at 500 and
+    /// capped at an even share of the distance, and the last bound is always the range.
+    #[test]
+    fn the_retail_split_uses_the_first_slice_as_a_fraction() {
+        let bounds = |count, first, distance: f32, range| {
+            retail_cascade_bounds(count, first, distance, range, 15.0)
+        };
+        // A first slice of 1250 (the compiled value) moves the first bound down from 2000's.
+        let template = bounds(2, 2_000.0, 8_000.0, 8_000.0);
+        let compiled = bounds(2, 1_250.0, 8_000.0, 8_000.0);
+        assert!(compiled[0] < template[0]);
+        // The fraction is floored at 500 and capped at distance / count.
+        assert_eq!(
+            bounds(2, 100.0, 8_000.0, 8_000.0),
+            bounds(2, 500.0, 8_000.0, 8_000.0)
+        );
+        assert_eq!(
+            bounds(2, 9_000.0, 8_000.0, 8_000.0),
+            bounds(2, 4_000.0, 8_000.0, 8_000.0)
+        );
+        for count in 2..=4 {
+            let bounds = bounds(count, 2_000.0, 10_000.0, 10_000.0);
+            assert_eq!(bounds.len(), count);
+            assert!((bounds[count - 1] - 10_000.0).abs() < 0.01);
+            assert!(
+                bounds.windows(2).all(|pair| pair[0] < pair[1]),
+                "{bounds:?}"
+            );
+        }
+        assert_eq!(bounds(1, 2_000.0, 10_000.0, 7_000.0), vec![7_000.0]);
+    }
+
+    /// The sun's shadows reach the grid the streamer draws, whichever way the camera faces, when no
+    /// `fShadowDistance` caps them. The near distance is Bevy's default read in metres; the last
+    /// bound is this engine's drawn grid.
+    #[test]
+    fn the_sun_shadows_cover_the_drawn_grid() {
+        let config = grid_fitted(EngineConfig {
+            sun_shadow_cascades: 4,
+            ..EngineConfig::default()
+        });
+        let cascades = sun_shadow_cascades(&config);
+        let last = *cascades.bounds.last().unwrap();
+        let cell = crate::world::components::CELL_SIZE;
+        assert_eq!(config.stream_radius, 2);
+        // Cells are requested inside the stream radius and kept until they leave the unload ring,
+        // one wider, so the unload ring is the grid that keeps drawing.
+        assert_eq!(config.unload_radius, 3);
+        assert_eq!(cascades.bounds.len(), 4);
 
         // The camera stands somewhere inside its own cell and cells stay resident - and keep
         // drawing - out to `unload_radius` cells around that cell, so the grid is
@@ -4898,24 +5100,19 @@ mod tests {
         let corner = axis * std::f32::consts::SQRT_2;
         let reach = corner.hypot(camera_offset(&config).y);
         assert!(
-            cascades.bounds[3] > axis,
-            "the grid straight ahead is shadowed: {} covers {axis}",
-            cascades.bounds[3]
+            last > axis,
+            "the grid straight ahead is shadowed: {last} covers {axis}"
         );
-        // `calculate_cascade_bounds` reaches the maximum distance geometrically, so the last bound
-        // is the requested distance to within a rounding error rather than to the bit.
         assert!(
-            (cascades.bounds[3] - reach).abs() < 1.0,
-            "and the far corner is inside the last cascade too: {} against {reach}",
-            cascades.bounds[3]
+            (last - reach).abs() < 1.0,
+            "and the far corner is inside the last cascade too: {last} against {reach}"
         );
         // The requested radius is not the drawn grid: a range fitted to `stream_radius` alone would
         // leave the ring the streamer keeps beyond it lit flat.
         let requested = cell * (config.stream_radius as f32 + 1.0) * std::f32::consts::SQRT_2;
         assert!(
-            cascades.bounds[3] > requested,
-            "the unload ring is covered as well: {} against {requested}",
-            cascades.bounds[3]
+            last > requested,
+            "the unload ring is covered as well: {last} against {requested}"
         );
 
         assert!(
@@ -4938,28 +5135,23 @@ mod tests {
 
     #[test]
     fn the_skyrim_ini_shadow_distance_caps_the_grid_range() {
-        let cap = EngineConfig {
-            sun_shadow_distance_limit: Some(8_000.0),
-            ..EngineConfig::default()
+        let last = |limit| {
+            let config = EngineConfig {
+                sun_shadow_distance_limit: Some(limit),
+                ..EngineConfig::default()
+            };
+            let cascades = sun_shadow_cascades(&config);
+            assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
+            *cascades.bounds.last().unwrap()
         };
-        let cascades = sun_shadow_cascades(&cap);
-        assert!((cascades.bounds[3] - 8_000.0).abs() < 0.01);
-        assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
-
-        let max_grid = EngineConfig {
-            sun_shadow_distance_limit: Some(23_200.0),
-            ..EngineConfig::default()
-        };
-        let cascades = sun_shadow_cascades(&max_grid);
-        assert!((cascades.bounds[3] - 23_200.0).abs() < 0.01);
-
-        let short_range = EngineConfig {
-            sun_shadow_distance_limit: Some(700.0),
-            ..EngineConfig::default()
-        };
-        let cascades = sun_shadow_cascades(&short_range);
-        assert!((cascades.bounds[3] - 700.0).abs() < 0.01);
-        assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!((last(8_000.0) - 8_000.0).abs() < 0.01);
+        // The grid is smaller than 23,200 + 1: the cap is the drawn grid beyond it.
+        let grid = *sun_shadow_cascades(&grid_fitted(EngineConfig::default()))
+            .bounds
+            .last()
+            .unwrap();
+        assert!((last(1.0e6) - grid).abs() < 0.01);
+        assert!((last(700.0) - 700.0).abs() < 0.01);
     }
 
     /// Explicit CLI bearings retain their calibrated Creation-to-engine ray mapping.
@@ -5015,24 +5207,24 @@ mod tests {
         let above = corner.hypot(camera_offset(&overhead).y);
         assert!(above > walk_around, "the camera's height counts");
 
-        let cascades = sun_shadow_cascades(&overhead);
+        let cascades = sun_shadow_cascades(&grid_fitted(overhead));
+        let last = *cascades.bounds.last().unwrap();
         assert!(
-            (cascades.bounds[3] - above).abs() < 1.0,
-            "the overhead camera's range reaches its own corner: {} against {above}",
-            cascades.bounds[3]
+            (last - above).abs() < 1.0,
+            "the overhead camera's range reaches its own corner: {last} against {above}"
         );
 
-        let walk_around_cascades = sun_shadow_cascades(&EngineConfig::default());
+        let walk_around_cascades = sun_shadow_cascades(&grid_fitted(EngineConfig::default()));
+        let last = *walk_around_cascades.bounds.last().unwrap();
         assert!(
-            (walk_around_cascades.bounds[3] - walk_around).abs() < 1.0,
-            "and the walk-around camera's reaches its: {} against {walk_around}",
-            walk_around_cascades.bounds[3]
+            (last - walk_around).abs() < 1.0,
+            "and the walk-around camera's reaches its: {last} against {walk_around}"
         );
     }
 
     /// The range follows the grid the streamer draws: at each stream radius the command line takes,
-    /// the far corner of the unload ring is inside the last cascade, while the two near distances
-    /// stay Bevy's defaults in Creation units rather than following the grid.
+    /// the far corner of the unload ring is inside the last cascade when no `fShadowDistance` caps
+    /// the range.
     #[test]
     fn the_shadow_range_follows_the_drawn_grid() {
         let cell = crate::world::components::CELL_SIZE;
@@ -5040,18 +5232,14 @@ mod tests {
         for radius in [0, 1, 2, 4, 8, 16] {
             // `--stream-radius` takes one radius and keeps cells a ring wider than it.
             let args = ["--stream-radius".to_owned(), radius.to_string()];
-            let config = EngineConfig::run_from_args(args);
+            let config = grid_fitted(EngineConfig::run_from_args(args));
             assert_eq!(
                 (config.stream_radius, config.unload_radius),
                 (radius, radius + 1)
             );
             let cascades = sun_shadow_cascades(&config);
-            assert_eq!(cascades.bounds.len(), SUN_SHADOW_CASCADES);
-            assert_eq!(
-                cascades.bounds[0],
-                10.0 * CREATION_UNITS_PER_METRE,
-                "the first cascade is set in metres, not by the grid, at radius {radius}"
-            );
+            assert_eq!(cascades.bounds.len(), config.sun_shadow_cascades);
+            let last = *cascades.bounds.last().unwrap();
             assert!(cascades.minimum_distance < cascades.bounds[0]);
             assert!(
                 cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]),
@@ -5064,46 +5252,40 @@ mod tests {
             let corner = axis * std::f32::consts::SQRT_2;
             let reach = corner.hypot(camera_offset(&config).y);
             assert!(
-                cascades.bounds[3] > axis,
-                "radius {radius} shadows the grid straight ahead: {} covers {axis}",
-                cascades.bounds[3]
+                last > axis,
+                "radius {radius} shadows the grid straight ahead: {last} covers {axis}"
             );
             assert!(
-                (cascades.bounds[3] - reach).abs() < 1.0,
-                "radius {radius} reaches the far corner: {} against {reach}",
-                cascades.bounds[3]
+                (last - reach).abs() < 1.0,
+                "radius {radius} reaches the far corner: {last} against {reach}"
             );
-            assert!(
-                cascades.bounds[3] > previous,
-                "a wider grid is more world to shadow"
-            );
-            previous = cascades.bounds[3];
+            assert!(last > previous, "a wider grid is more world to shadow");
+            previous = last;
         }
 
         // The command line refuses a negative stream radius, but a configuration built in code can
         // still hold one. It streams nothing, and the range derived from it would fall under the
-        // first cascade's far bound - which `CascadeShadowConfigBuilder::build` rejects by panic.
-        // The engine clamps it and starts.
+        // cascade near distance. The engine clamps it and starts.
         let nothing = EngineConfig {
             stream_radius: -4,
             unload_radius: -3,
             ..EngineConfig::default()
         };
         let cascades = sun_shadow_cascades(&nothing);
-        assert!(cascades.bounds[3] > 10.0 * CREATION_UNITS_PER_METRE);
+        assert!(*cascades.bounds.last().unwrap() > 10.0 * CREATION_UNITS_PER_METRE);
         assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
 
         // A radius no engine could stream is capped rather than asked for: the range is fitted to
         // the widest grid `sun_shadow_cascades` will fit one to.
         let args = ["--stream-radius".to_owned(), "100000".to_owned()];
-        let gigametres = EngineConfig::run_from_args(args);
+        let gigametres = grid_fitted(EngineConfig::run_from_args(args));
         let widest = cell * SUN_SHADOW_MAX_GRID_CELLS as f32 * std::f32::consts::SQRT_2;
         let reach = widest.hypot(camera_offset(&gigametres).y);
         let cascades = sun_shadow_cascades(&gigametres);
+        let last = *cascades.bounds.last().unwrap();
         assert!(
-            (cascades.bounds[3] - reach).abs() < 1.0,
-            "a radius of 100000 cells is capped at {SUN_SHADOW_MAX_GRID_CELLS}: {} against {reach}",
-            cascades.bounds[3]
+            (last - reach).abs() < 1.0,
+            "a radius of 100000 cells is capped at {SUN_SHADOW_MAX_GRID_CELLS}: {last} against {reach}"
         );
     }
 
@@ -5156,7 +5338,8 @@ mod tests {
         // `resource` panics if `setup_world` left the shadow map size unset, which is one of the
         // two ways this test can fail.
         let shadow_map = world.resource::<DirectionalLightShadowMap>();
-        assert_eq!(shadow_map.size, SUN_SHADOW_MAP_SIZE);
+        assert_eq!(shadow_map.size, config.sun_shadow_map_size);
+        assert_eq!(shadow_map.size, 4096, "Ultra.ini iShadowMapResolution");
     }
 
     /// A placed object is kept out of the reflection pass by its layer, so the streaming camera has
@@ -5226,6 +5409,42 @@ mod tests {
         assert!(app.world().get_resource::<ShotsRun>().is_none());
     }
 
+    /// #949: the world camera's near plane is retail's `fNearDistance` (15 units) with no INI, and
+    /// an INI value replaces it.
+    #[test]
+    fn world_camera_near_plane_is_retail_and_follows_the_ini() {
+        for (config, near) in [
+            (EngineConfig::default(), 15.0),
+            (
+                EngineConfig {
+                    near_distance: 4.0,
+                    ..default()
+                },
+                4.0,
+            ),
+        ] {
+            let mut app = App::new();
+            app.insert_resource(config)
+                .add_systems(Startup, setup_world);
+            app.update();
+            let mut cameras = app
+                .world_mut()
+                .query_filtered::<&Projection, With<StreamingCamera>>();
+            let Projection::Perspective(projection) = cameras.single(app.world()).unwrap() else {
+                panic!("perspective camera")
+            };
+            assert_eq!(projection.near, near);
+            let mut lookups = app
+                .world_mut()
+                .query_filtered::<&crate::room_culling::RoomCullingNear, With<StreamingCamera>>();
+            assert_eq!(
+                lookups.single(app.world()).unwrap().distance(),
+                near,
+                "the room lookup follows the render near plane"
+            );
+        }
+    }
+
     fn interactive_framing_app(settings_path: &Path, shot_path: Option<PathBuf>) -> App {
         let args = shot_path.map_or_else(Vec::new, |path| {
             vec!["--start-shot".to_owned(), path.to_str().unwrap().to_owned()]
@@ -5264,7 +5483,9 @@ mod tests {
         let Projection::Perspective(projection) = query.single(app.world()).unwrap() else {
             panic!("perspective camera")
         };
-        assert!((projection.fov - fov.to_radians()).abs() < 1e-6);
+        // `fov` is the horizontal angle, as the settings hold it (#904).
+        let vertical = crate::settings::vertical_fov_radians(fov, projection.aspect_ratio);
+        assert!((projection.fov - vertical).abs() < 1e-6);
         let mut query = app
             .world_mut()
             .query_filtered::<&Window, With<bevy::window::PrimaryWindow>>();
@@ -5297,7 +5518,7 @@ mod tests {
         // Include a preset equal to the reset default: reset must still clear custom dimensions.
         for window_size in [1, 3] {
             let saved = RenderingSettings {
-                fov_degrees: 99.0,
+                horizontal_fov_degrees: 99.0,
                 window_size,
                 window_mode: 1,
                 ..default()
@@ -5305,7 +5526,7 @@ mod tests {
             let bytes = serde_json::to_vec(&saved).unwrap();
             std::fs::write(&settings_path, &bytes).unwrap();
             let mut app = interactive_framing_app(&settings_path, Some(shot_path.clone()));
-            let fov = crate::shots::vertical_fov_degrees(18.0, 1379.0 / 911.0);
+            let fov = 18.0;
             app.update();
             assert_interactive_framing(&mut app, fov, (1379, 911));
             app.world_mut().resource_mut::<RenderingSettings>().hud = false;
@@ -5317,7 +5538,10 @@ mod tests {
             app.world_mut().resource_mut::<SettingsFile>().save(&active);
             let persisted: RenderingSettings =
                 serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
-            assert_eq!(persisted.fov_degrees, saved.fov_degrees);
+            assert_eq!(
+                persisted.horizontal_fov_degrees,
+                saved.horizontal_fov_degrees
+            );
             assert_eq!(persisted.window_size, saved.window_size);
             assert_eq!(persisted.window_mode, saved.window_mode);
             assert_eq!(persisted.window_size_override, None);
@@ -5327,7 +5551,7 @@ mod tests {
             let defaults = RenderingSettings::default();
             assert_interactive_framing(
                 &mut app,
-                defaults.fov_degrees,
+                defaults.horizontal_fov_degrees,
                 WINDOW_SIZES[defaults.window_size],
             );
         }
@@ -5345,7 +5569,7 @@ mod tests {
         {
             let mut settings = app.world_mut().resource_mut::<RenderingSettings>();
             settings.window_size = 2;
-            settings.fov_degrees = 75.0;
+            settings.horizontal_fov_degrees = 75.0;
         }
         app.update();
         assert_interactive_framing(&mut app, 75.0, WINDOW_SIZES[2]);
@@ -5361,7 +5585,7 @@ mod tests {
         for saved in [
             None,
             Some(RenderingSettings {
-                fov_degrees: 90.0,
+                horizontal_fov_degrees: 90.0,
                 window_size: 3,
                 ..default()
             }),
@@ -5375,14 +5599,14 @@ mod tests {
             app.update();
             assert_interactive_framing(
                 &mut app,
-                expected.fov_degrees,
+                expected.horizontal_fov_degrees,
                 WINDOW_SIZES[expected.window_size],
             );
             reset_interactive_settings(&mut app);
             let defaults = RenderingSettings::default();
             assert_interactive_framing(
                 &mut app,
-                defaults.fov_degrees,
+                defaults.horizontal_fov_degrees,
                 WINDOW_SIZES[defaults.window_size],
             );
         }
@@ -5666,6 +5890,39 @@ mod tests {
         ] {
             assert_ne!(left, right);
         }
+    }
+
+    /// A manifest that lists intended omissions (records with no usable value, #811) is complete
+    /// and loads. The engine reads only `complete`; the added field changes nothing for it.
+    #[test]
+    fn accepts_a_manifest_that_lists_intended_omissions() {
+        let directory = tempfile::tempdir().unwrap();
+        write_runtime_asset_database(&directory.path().join("skyrim_world.db"));
+        std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
+        std::fs::write(
+            directory.path().join("conversion-manifest.json"),
+            format!(
+                r#"{{"schema_version":{},"complete":true,"record_data_complete":true,
+                "intended_omissions":[{{"source":"Skyrim.esm","record_type":"LAND",
+                "class":"land_missing_heights","count":154,
+                "first_example":"LAND 000B2797: no VHGT height field"}}]}}"#,
+                converter_schema_version()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("integration-report.json"),
+            format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
+        let config = EngineConfig {
+            assets_dir: directory.path().to_owned(),
+            ..default()
+        };
+        validate_runtime_assets(&config).unwrap();
     }
 
     /// Current, complete assets load, and an integration report newer than the engine is rejected.
