@@ -21,6 +21,9 @@
 //! | `[Display]` | `fDefaultWorldFOV` | horizontal field of view of every camera but the first-person one, in degrees (retail 80; accepted 30 to 140, a Mudcrab-only bound); converted to Bevy's vertical angle at the window's aspect ratio |
 //! | `[Display]` | `fDefault1stPersonFOV` | horizontal field of view of the first-person (walking) camera, in degrees (retail 80) |
 //! | `[Display]` | `fNearDistance` | camera near plane and room-lookup distance, in Creation units (retail 15 is observed; the key name is from the community default dump, unverified; accepted above 0 up to 1000, a Mudcrab-only bound) |
+//! | `[Display]` | `fLightLODStartFade` | distance at which a placed light's distance fade begins, in Creation units (retail 3500 from `Skyrim_Default.ini`; 0 or more) |
+//! | `[Display]` | `fLightLODRange` | length added to the start fade for the end distance (retail compiled default 500; 0 or more) |
+//! | `[General]` | `fFlickeringLightDistance` | distance from the player within which flickering and pulsing lights update (retail compiled default 1024; above 0) |
 //! | `[Display]` | `bDrawLandShadows` | 1 makes terrain cast sun shadows; the default 0 matches [Skyrim](https://github.com/Mudcrab-Team/skyrim_decomp/blob/main/findings/sun-shadows-retail-facts.md#4-object-and-terrain-lod). In retail it affects near land only; here it also affects LOD land until a later change limits it |
 //! | `[TerrainManager]` | `fSplitDistanceMult` | terrain LOD split rule: a block of `level` cells splits into its four children under `fSplitDistanceMult` x `level` x 2,048 x sqrt(2) units (34,756 / 69,512 at levels 8 / 16 with 1.5) |
 //! | `[TerrainManager]` | `fBlockMaximumDistance` | outer reach of tier 16, times `fSplitDistanceMult`, until a level-32 tier exists (not a retail terrain cut) |
@@ -140,6 +143,22 @@ fn expected_range(section: &str, key: &str) -> Option<String> {
             "a distance above 0 and at most {}",
             crate::config::MAX_NEAR_DISTANCE
         )),
+        ("display", "flightlodstartfade") | ("display", "flightlodrange") => {
+            Some("a distance of 0 or more".into())
+        }
+        ("general", "fflickeringlightdistance") => Some("a distance above 0".into()),
+        ("display", "busefilmiccurve") | ("display", "busemultipleluminancereferences") => {
+            Some("0 or 1".into())
+        }
+        ("display", "freinhardwhitescale")
+        | ("display", "ffilmicwhitescale")
+        | ("display", "fglobaleyeadaptspeedscale")
+        | ("display", "fglobaleyeadaptstrengthscale")
+        | ("display", "fgamma") => Some("a positive number".into()),
+        ("display", "fglobalsaturationboost")
+        | ("display", "fglobalbrightnessboost")
+        | ("display", "fglobalcontrastboost")
+        | ("display", "fglobalbloomthresholdboost") => Some("a number".into()),
         _ => None,
     }
 }
@@ -149,6 +168,13 @@ fn parse_positive(raw: &str) -> Option<f32> {
     raw.parse::<f32>()
         .ok() // silent-ok: The INI merge reports invalid values before inserting them.
         .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+/// A finite number of at least zero.
+fn parse_non_negative(raw: &str) -> Option<f32> {
+    raw.parse::<f32>()
+        .ok() // silent-ok: The INI merge reports invalid values before inserting them.
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 /// Whether a value of a key `apply` validates is usable: `Some(true)` or `Some(false)`, or `None`
@@ -168,6 +194,24 @@ fn is_usable(section: &str, key: &str, raw: &str) -> Option<bool> {
             Some(parse_fov(raw).is_some())
         }
         ("display", "fneardistance") => Some(parse_near_distance(raw).is_some()),
+        ("display", "busefilmiccurve") | ("display", "busemultipleluminancereferences") => {
+            Some(parse_flag(raw).is_some())
+        }
+        ("display", "freinhardwhitescale")
+        | ("display", "ffilmicwhitescale")
+        | ("display", "fglobaleyeadaptspeedscale")
+        | ("display", "fglobaleyeadaptstrengthscale")
+        | ("display", "fgamma") => Some(parse_positive(raw).is_some()),
+        ("display", "fglobalsaturationboost")
+        | ("display", "fglobalbrightnessboost")
+        | ("display", "fglobalcontrastboost")
+        | ("display", "fglobalbloomthresholdboost") => {
+            Some(raw.parse::<f32>().is_ok_and(f32::is_finite))
+        }
+        ("display", "flightlodstartfade") | ("display", "flightlodrange") => {
+            Some(parse_non_negative(raw).is_some())
+        }
+        ("general", "fflickeringlightdistance") => Some(parse_positive(raw).is_some()),
         ("terrainmanager", "fblocklevel0distance")
         | ("terrainmanager", "fblocklevel1distance")
         | ("terrainmanager", "fblockmaximumdistance")
@@ -190,6 +234,31 @@ fn is_usable(section: &str, key: &str, raw: &str) -> Option<bool> {
     }
 }
 
+/// Decodes INI bytes. A line that is valid UTF-8 stays as it is. Any other line is
+/// Windows-1252, the code page of Skyrim's own text files, and gets a warning with the
+/// file name, the line number and the count of bytes decoded that way. Only that line
+/// can change: the rest of the file applies as usual.
+fn decode_ini(bytes: &[u8], source: &str) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let mut text = String::with_capacity(bytes.len());
+    for (index, line) in bytes.split_inclusive(|&byte| byte == b'\n').enumerate() {
+        match std::str::from_utf8(line) {
+            Ok(valid) => text.push_str(valid),
+            Err(_) => {
+                let high = line.iter().filter(|byte| !byte.is_ascii()).count();
+                eprintln!(
+                    "warning: {source}:{}: line is not UTF-8; decoding {high} non-ASCII byte(s) as Windows-1252",
+                    index + 1
+                );
+                text.push_str(&shared::plugin_selection::decode_windows_1252(line));
+            }
+        }
+    }
+    text
+}
+
 /// Values from one or more INI files, keyed by lower-cased section and key.
 #[derive(Debug, Default)]
 pub struct SkyrimIni {
@@ -200,10 +269,13 @@ pub struct SkyrimIni {
 impl SkyrimIni {
     /// Reads `path` over the values already read, as Skyrim layers its INI files.
     pub fn merge_file(&mut self, path: &Path) -> std::io::Result<()> {
-        let text = std::fs::read_to_string(path)?;
-        self.merge_named_str(&text, &path.display().to_string());
+        let bytes = std::fs::read(path)?;
+        let name = path.display().to_string();
+        let text = decode_ini(&bytes, &name);
+        self.merge_named_str(&text, &name);
+        // The source hash covers the raw file bytes, not the decoded text.
         self.sources
-            .push(Source::from_bytes(path.to_owned(), text.as_bytes()));
+            .push(Source::from_bytes(path.to_owned(), &bytes));
         Ok(())
     }
 
@@ -265,6 +337,59 @@ impl SkyrimIni {
         self.values
             .get(&(section.to_ascii_lowercase(), key.to_ascii_lowercase()))
             .map(|entry| entry.value.as_str())
+    }
+
+    /// The `[Display]` keys of retail's HDR chain (`retail_hdr.rs`). A malformed value is reported
+    /// and leaves the compiled default.
+    fn apply_retail_hdr(&self, config: &mut EngineConfig) {
+        if let Some(raw) = self.get("Display", "bUseFilmicCurve") {
+            match parse_flag(raw) {
+                Some(value) => config.retail_hdr.filmic = value,
+                None => eprintln!("warning: ignoring bUseFilmicCurve={raw:?}; expected 0 or 1"),
+            }
+        }
+        if let Some(raw) = self.get("Display", "bUseMultipleLuminanceReferences") {
+            match parse_flag(raw) {
+                Some(value) => config.retail_hdr.multiple_luminance_references = value,
+                None => eprintln!(
+                    "warning: ignoring bUseMultipleLuminanceReferences={raw:?}; expected 0 or 1"
+                ),
+            }
+        }
+        let hdr = &mut config.retail_hdr;
+        for (key, setting) in [
+            ("fReinhardWhiteScale", &mut hdr.reinhard_white_scale),
+            ("fFilmicWhiteScale", &mut hdr.filmic_white_scale),
+            ("fGlobalEyeAdaptSpeedScale", &mut hdr.eye_adapt_speed_scale),
+            (
+                "fGlobalEyeAdaptStrengthScale",
+                &mut hdr.eye_adapt_strength_scale,
+            ),
+            ("fGamma", &mut hdr.gamma),
+        ] {
+            let Some(raw) = self.get("Display", key) else {
+                continue;
+            };
+            match parse_positive(raw) {
+                Some(value) => *setting = value,
+                None => eprintln!("warning: ignoring {key}={raw:?}; expected a positive number"),
+            }
+        }
+        for (key, setting) in [
+            ("fGlobalSaturationBoost", &mut hdr.saturation_boost),
+            ("fGlobalBrightnessBoost", &mut hdr.brightness_boost),
+            ("fGlobalContrastBoost", &mut hdr.contrast_boost),
+            ("fGlobalBloomThresholdBoost", &mut hdr.bloom_threshold_boost),
+        ] {
+            let Some(raw) = self.get("Display", key) else {
+                continue;
+            };
+            let parsed = raw.parse::<f32>().ok(); // silent-ok: the warning below reports it.
+            match parsed.filter(|value| value.is_finite()) {
+                Some(value) => *setting = value,
+                None => eprintln!("warning: ignoring {key}={raw:?}; expected a number"),
+            }
+        }
     }
 
     /// Apply terrain keys and retain the grass report. Grass runtime values apply
@@ -351,6 +476,31 @@ impl SkyrimIni {
                 None => eprintln!(
                     "warning: ignoring fNearDistance={raw:?}; expected a distance above 0 and at most {}",
                     crate::config::MAX_NEAR_DISTANCE
+                ),
+            }
+        }
+        for (section, key, setting) in [
+            (
+                "Display",
+                "fLightLODStartFade",
+                &mut config.light_lod_start_fade,
+            ),
+            ("Display", "fLightLODRange", &mut config.light_lod_range),
+        ] {
+            let Some(raw) = self.get(section, key) else {
+                continue;
+            };
+            match parse_non_negative(raw) {
+                Some(value) => *setting = value,
+                None => eprintln!("warning: ignoring {key}={raw:?}; expected 0 or more"),
+            }
+        }
+        self.apply_retail_hdr(config);
+        if let Some(raw) = self.get("General", "fFlickeringLightDistance") {
+            match parse_positive(raw) {
+                Some(value) => config.flickering_light_distance = value,
+                None => eprintln!(
+                    "warning: ignoring fFlickeringLightDistance={raw:?}; expected a positive number"
                 ),
             }
         }
@@ -530,8 +680,108 @@ mod tests {
         config
     }
 
+    /// One Windows-1252 byte in a comment must not drop the rest of the file. The source
+    /// hash covers the raw bytes.
+    #[test]
+    fn non_utf8_comment_keeps_the_other_keys_and_hashes_the_raw_bytes() {
+        let bytes: &[u8] = b"[General]\r\n; Jos\xe9's settings\r\nbAlwaysActive=1\r\n[Display]\r\nsName=Caf\xe9\r\n";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Skyrim.ini");
+        std::fs::write(&path, bytes).unwrap();
+        let mut ini = SkyrimIni::default();
+        ini.merge_file(&path).unwrap();
+        assert_eq!(ini.get("General", "bAlwaysActive"), Some("1"));
+        assert_eq!(ini.get("Display", "sName"), Some("Caf\u{e9}"));
+        assert_eq!(
+            ini.sources[0].sha256,
+            Source::from_bytes(path.clone(), bytes).sha256
+        );
+    }
+
+    /// Valid UTF-8 text decodes unchanged, and only invalid lines use Windows-1252.
+    #[test]
+    fn decode_ini_changes_only_the_invalid_lines() {
+        let utf8 = "[A]\n; caf\u{e9}\nk=v\n";
+        assert_eq!(decode_ini(utf8.as_bytes(), "t"), utf8);
+        assert_eq!(
+            decode_ini(b"[A]\n; caf\xe9\n; \xc3\xa9\nk=\x80\n", "t"),
+            "[A]\n; caf\u{e9}\n; \u{e9}\nk=\u{20ac}\n"
+        );
+    }
+
     /// #904, #949: the camera keys default to 80, 80 and 15 and an INI overrides each one. The
     /// sources are cited at the constants in `config.rs`.
+    /// The point-light distance fade and flicker keys (#955): the defaults of
+    /// [point-lights.md](../../../docs/specs/engine/point-lights.md), INI overrides, and a rejected
+    /// value keeps the default.
+    #[test]
+    fn light_distance_keys_default_to_retail_and_take_the_ini() {
+        let config = EngineConfig::default();
+        assert_eq!(config.light_lod_start_fade, 3500.0);
+        assert_eq!(config.light_lod_range, 500.0);
+        assert_eq!(config.flickering_light_distance, 1024.0);
+
+        let config = apply(
+            "[Display]\nfLightLODStartFade=1200\nfLightLODRange=0\n[General]\nfFlickeringLightDistance=2048\n",
+        );
+        assert_eq!(config.light_lod_start_fade, 1200.0);
+        assert_eq!(config.light_lod_range, 0.0);
+        assert_eq!(config.flickering_light_distance, 2048.0);
+
+        let config = apply(
+            "[Display]\nfLightLODStartFade=-1\nfLightLODRange=abc\n[General]\nfFlickeringLightDistance=0\n",
+        );
+        assert_eq!(config.light_lod_start_fade, 3500.0);
+        assert_eq!(config.light_lod_range, 500.0);
+        assert_eq!(config.flickering_light_distance, 1024.0);
+        // The key `fLightLODMaxStartFade` has no setting in the executable and is ignored.
+        assert_eq!(
+            apply("[Display]\nfLightLODMaxStartFade=100\n").light_lod_start_fade,
+            3500.0
+        );
+    }
+
+    /// The `[Display]` keys of the retail HDR chain default to the compiled values and take the
+    /// INI. A malformed value keeps the default.
+    #[test]
+    fn retail_hdr_keys_default_to_retail_and_take_the_ini() {
+        let defaults = apply("").retail_hdr;
+        assert!(!defaults.filmic);
+        assert_eq!(defaults.reinhard_white_scale, 1.1);
+        assert_eq!(defaults.filmic_white_scale, 1.4);
+        assert_eq!(defaults.eye_adapt_speed_scale, 2.0);
+        assert_eq!(defaults.eye_adapt_strength_scale, 0.4);
+        assert_eq!(defaults.gamma, 1.0);
+        assert_eq!(defaults.saturation_boost, 0.0);
+        assert_eq!(defaults.bloom_threshold_boost, 0.0);
+        assert!(defaults.multiple_luminance_references);
+
+        let set = apply(
+            "[Display]\nbUseFilmicCurve=1\nfReinhardWhiteScale=1.25\nfFilmicWhiteScale=1.5\n\
+             fGlobalEyeAdaptSpeedScale=3\nfGlobalEyeAdaptStrengthScale=0.5\nfGamma=1.2\n\
+             fGlobalSaturationBoost=0.1\nfGlobalBrightnessBoost=-0.2\nfGlobalContrastBoost=0.3\n\
+             fGlobalBloomThresholdBoost=0.05\nbUseMultipleLuminanceReferences=0\n",
+        )
+        .retail_hdr;
+        assert!(set.filmic);
+        assert_eq!(set.reinhard_white_scale, 1.25);
+        assert_eq!(set.filmic_white_scale, 1.5);
+        assert_eq!(set.eye_adapt_speed_scale, 3.0);
+        assert_eq!(set.eye_adapt_strength_scale, 0.5);
+        assert_eq!(set.gamma, 1.2);
+        assert_eq!(set.saturation_boost, 0.1);
+        assert_eq!(set.brightness_boost, -0.2);
+        assert_eq!(set.contrast_boost, 0.3);
+        assert_eq!(set.bloom_threshold_boost, 0.05);
+        assert!(!set.multiple_luminance_references);
+
+        let bad = apply(
+            "[Display]\nbUseFilmicCurve=2\nfGamma=0\nfReinhardWhiteScale=abc\nfGlobalContrastBoost=inf\n",
+        )
+        .retail_hdr;
+        assert_eq!(bad, defaults);
+    }
+
     #[test]
     fn camera_keys_default_to_retail_and_an_ini_overrides_them() {
         let config = apply("");

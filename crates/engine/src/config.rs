@@ -560,11 +560,46 @@ pub struct EngineConfig {
     /// (#949). Retail default [`RETAIL_NEAR_DISTANCE`]; source:
     /// [skyrim-culling-rea-parity.md](../../../docs/research/skyrim-culling-rea-parity.md).
     pub near_distance: f32,
+    /// `[Display] fLightLODStartFade`: the distance, in Creation units, at which a placed light's
+    /// distance fade begins (#955). Default [`RETAIL_LIGHT_LOD_START_FADE`].
+    pub light_lod_start_fade: f32,
+    /// `[Display] fLightLODRange`: the fade length added to the start fade for the end distance
+    /// (#955). Default [`RETAIL_LIGHT_LOD_RANGE`].
+    pub light_lod_range: f32,
+    /// `[General] fFlickeringLightDistance`: lights farther than this from the player keep their
+    /// last flicker or pulse fade (#955). Default [`RETAIL_FLICKERING_LIGHT_DISTANCE`].
+    pub flickering_light_distance: f32,
+    /// The `[Display]` keys of retail's HDR tonemap chain under the `skyrim` profile (#796, #361):
+    /// `bUseFilmicCurve`, the white scales, the eye adaptation scales, `fGamma` and the global
+    /// boosts. Every default is the compiled retail value (`retail_hdr.rs`).
+    pub retail_hdr: crate::retail_hdr::RetailHdrConfig,
     /// Whether converted Papyrus scripts run (`--papyrus-scripts`): the first slice attaches a
     /// small vetted set to the references that carry them. Off by default.
     pub papyrus_scripts: bool,
     pub physics_fixture: bool,
 }
+
+/// Retail's default for `[Display] fLightLODStartFade`: 3500 Creation units (#955, #949).
+///
+/// Source tier: shipped INI. `Skyrim_Default.ini` sets `[Display] fLightLODStartFade=3500.0`;
+/// `Ultra.ini` does not set it. The distance dimmer reads it as the begin distance when no room
+/// template, cell or exterior override supplies one
+/// ([NEEDS 20 answer](https://github.com/Mudcrab-Team/skyrim_decomp/pull/1073), static, unverified at run time).
+pub const RETAIL_LIGHT_LOD_START_FADE: f32 = 3500.0;
+
+/// Retail's default for `[Display] fLightLODRange`: 500 Creation units (#955, #949).
+///
+/// Source tier: compiled executable default. No shipped INI default file sets it (the player's
+/// `Skyrim.ini` holds 4096, which is a tuned value, not a default). The end distance is
+/// `fLightLODStartFade + fLightLODRange`
+/// ([NEEDS 20 answer](https://github.com/Mudcrab-Team/skyrim_decomp/pull/1073)).
+pub const RETAIL_LIGHT_LOD_RANGE: f32 = 500.0;
+
+/// Retail's default for `[General] fFlickeringLightDistance`: 1024 Creation units (#955, #949).
+///
+/// Source tier: compiled executable default; no shipped default INI sets it
+/// ([NEEDS 20 answer](https://github.com/Mudcrab-Team/skyrim_decomp/pull/1073)).
+pub const RETAIL_FLICKERING_LIGHT_DISTANCE: f32 = 1024.0;
 
 /// Retail's default for `[Display] bDrawLandShadows` is off. See Mudcrab #949.
 pub const RETAIL_DRAW_LAND_SHADOWS: bool = false;
@@ -769,6 +804,10 @@ impl Default for EngineConfig {
             world_fov_degrees: RETAIL_DEFAULT_WORLD_FOV_DEGREES,
             first_person_fov_degrees: RETAIL_DEFAULT_FIRST_PERSON_FOV_DEGREES,
             near_distance: RETAIL_NEAR_DISTANCE,
+            light_lod_start_fade: RETAIL_LIGHT_LOD_START_FADE,
+            light_lod_range: RETAIL_LIGHT_LOD_RANGE,
+            flickering_light_distance: RETAIL_FLICKERING_LIGHT_DISTANCE,
+            retail_hdr: crate::retail_hdr::RetailHdrConfig::default(),
             papyrus_scripts: false,
             physics_fixture: false,
         }
@@ -2033,6 +2072,15 @@ impl EngineConfig {
                 requires: "--shots",
             });
         }
+        // The profile owns the grade default. `--color-grade` is refused under `skyrim`, so the
+        // default only applies when the flag is absent.
+        if !config
+            .settings_overrides
+            .iter()
+            .any(|flag| flag == "--color-grade")
+        {
+            config.color_grade = config.visual_profile.default_color_grade();
+        }
         config.check_visual_profile()?;
         grass_options.apply(&mut config);
         config.drop_jump_the_run_would_overwrite();
@@ -2426,6 +2474,9 @@ mod tests {
         // never launches the engine, so its flags are not engine options.
         ("workspace.py", "--apply"),
         ("workspace.py", "--artifact-dir"),
+        ("workspace.py", "--cached"),
+        ("workspace.py", "--exclude-standard"),
+        ("workspace.py", "--others"),
         ("workspace.py", "--get"),
         ("workspace.py", "--git-common-dir"),
         ("workspace.py", "--git-hook"),
@@ -3653,7 +3704,7 @@ mod tests {
         assert!(
             EngineConfig {
                 benchmark_frames: Some(60),
-                ..flying.clone()
+                ..flying
             }
             .records_fly_lag()
         );
@@ -5630,7 +5681,7 @@ mod tests {
         std::fs::write(&utility, "--meshoptimizer x").unwrap();
         assert_eq!(
             script_paths(directory.path()),
-            vec![registered.clone(), utility.clone()]
+            vec![registered, utility.clone()]
         );
         assert_eq!(
             checked_script_engine_flags(&std::fs::read_to_string(&utility).unwrap(), &utility),

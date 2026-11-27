@@ -110,7 +110,11 @@ fn prepare_start_camera(
         config.worldspace_id = worldspace;
     }
     if let Some((settings, settings_file)) = preferences {
-        settings_file.apply_start_shot(settings, file.shots[0].hfov, (file.width, file.height));
+        settings_file.apply_start_shot(
+            settings,
+            crate::settings::retail_fov_for_frame(file.shots[0].hfov, file.aspect()),
+            (file.width, file.height),
+        );
     }
     Ok(Some(InitialWorldCameraPose {
         shot: file.shots[0].clone(),
@@ -379,7 +383,25 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                             weather.fog_omissions.join(", ")
                         );
                     }
-                    let note = format!("weather {}: sky and fog from the record", weather.label());
+                    let skyrim =
+                        config.visual_profile == crate::visual_profile::VisualProfile::Skyrim;
+                    // The lighting driver runs only under `skyrim` (`sky::drive_exterior_lighting`).
+                    if skyrim && !weather.lighting_omissions.is_empty() {
+                        eprintln!(
+                            "warning: weather {}: the record has no {}; the exterior sun and ambient keep the fixed day light at every hour (#1007)",
+                            weather.label(),
+                            weather.lighting_omissions.join(", ")
+                        );
+                    }
+                    let lighting = if skyrim && weather.lighting_omissions.is_empty() {
+                        "; sun and ambient colour from the record by hour (the sun and ambient colour settings have no effect, #1006)"
+                    } else {
+                        ""
+                    };
+                    let note = format!(
+                        "weather {}: sky and fog from the record{lighting}",
+                        weather.label()
+                    );
                     grade_source.weather = Some(weather);
                     note
                 }
@@ -2643,7 +2665,7 @@ fn retail_cascade_bounds(
 /// and keeps the identity rotation; no direction is invented. Retail worlds always carry climate
 /// timing, so this is not retail behaviour: it affects only fixtures and benchmarks (a test-only
 /// path).
-fn sun_rotation(config: &EngineConfig, direction: Option<Vec3>) -> Quat {
+pub(crate) fn sun_rotation(config: &EngineConfig, direction: Option<Vec3>) -> Quat {
     let Some((azimuth_degrees, elevation_degrees)) = config.sun_position else {
         return match direction {
             Some(direction) => Quat::from_rotation_arc(Vec3::Z, direction),
@@ -2755,14 +2777,27 @@ fn setup_world(
     commands.insert_resource(DirectionalLightShadowMap {
         size: config.sun_shadow_map_size,
     });
-    // The sun and ambient colours are the clear weather's own (`WTHR` 0x81A, day). Their levels are
-    // the configured input ratio in `crate::lights::AMBIENT_ILLUMINANCE` (a simplified heuristic,
-    // not a rendered-parity calibration).
+    // The sun and ambient colours are the clear weather's own (`WTHR` 0x81A, day). Under
+    // `mudcrab` their levels are the configured input ratio in
+    // `crate::lights::AMBIENT_ILLUMINANCE` (a simplified heuristic, not a rendered-parity
+    // calibration). Under `skyrim` they are retail units until the weather and the cell write
+    // them (`retail_lighting.rs`).
     let weather_lighting = crate::sky::WeatherLighting::default();
+    let units = crate::retail_lighting::LightUnits::of(config.visual_profile);
+    let (sun_illuminance, ambient_brightness) = units.startup_levels();
+    let (sun_colour, ambient_colour) = if units.is_retail() {
+        let mean = weather_lighting.directional_ambient().mean;
+        (
+            crate::retail_lighting::raw_colour(weather_lighting.sunlight),
+            Color::linear_rgb(mean.x, mean.y, mean.z),
+        )
+    } else {
+        (weather_lighting.sunlight, weather_lighting.mean_ambient())
+    };
     commands.spawn((
         DirectionalLight {
-            color: weather_lighting.sunlight,
-            illuminance: crate::lights::SUN_ILLUMINANCE,
+            color: sun_colour,
+            illuminance: sun_illuminance,
             shadow_maps_enabled: true,
             ..default()
         },
@@ -2781,10 +2816,10 @@ fn setup_world(
         crate::sun::SunLight,
     ));
     commands.insert_resource(GlobalAmbientLight {
-        color: weather_lighting.mean_ambient(),
-        // The one definition of the ambient this world path applies: the converted lights are
-        // scaled against it (`crate::lights`).
-        brightness: crate::lights::AMBIENT_ILLUMINANCE,
+        color: ambient_colour,
+        // The one definition of the ambient this world path applies: under `mudcrab` the
+        // converted lights are scaled against it (`crate::lights`).
+        brightness: ambient_brightness,
         ..default()
     });
     info!(
@@ -5483,8 +5518,8 @@ mod tests {
         let Projection::Perspective(projection) = query.single(app.world()).unwrap() else {
             panic!("perspective camera")
         };
-        // `fov` is the horizontal angle, as the settings hold it (#904).
-        let vertical = crate::settings::vertical_fov_radians(fov, projection.aspect_ratio);
+        // `fov` is the retail-convention angle the settings hold: across 16:9, held vertically.
+        let vertical = crate::settings::retail_vertical_fov_radians(fov);
         assert!((projection.fov - vertical).abs() < 1e-6);
         let mut query = app
             .world_mut()
@@ -5526,7 +5561,8 @@ mod tests {
             let bytes = serde_json::to_vec(&saved).unwrap();
             std::fs::write(&settings_path, &bytes).unwrap();
             let mut app = interactive_framing_app(&settings_path, Some(shot_path.clone()));
-            let fov = 18.0;
+            // The pose's 18 degrees hold across its own 1379x911 frame.
+            let fov = crate::settings::retail_fov_for_frame(18.0, 1379.0 / 911.0);
             app.update();
             assert_interactive_framing(&mut app, fov, (1379, 911));
             app.world_mut().resource_mut::<RenderingSettings>().hud = false;
@@ -6177,6 +6213,7 @@ mod tests {
             reference: None,
             note: None,
             probes: Vec::new(),
+            sequence: 0,
         };
 
         assert_eq!(

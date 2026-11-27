@@ -108,9 +108,11 @@ pub struct RenderingSettings {
     /// Multiplier on retail fMouseHeadingSensitivity; 1 preserves the movement-type defaults.
     pub mouse_sensitivity: f32,
     /// Horizontal field of view in degrees, as retail's `fDefaultWorldFOV` and
-    /// `fDefault1stPersonFOV` are (#904). The camera's vertical angle follows from the window's
-    /// aspect ratio. The field was a vertical angle named `fov_degrees` until #904; an older
-    /// settings file keeps that key, which is ignored, so the retail default applies.
+    /// `fDefault1stPersonFOV` are (#904): the angle across a 16:9 window. Retail holds the
+    /// matching vertical angle on other windows, measured at 4:3, 16:9 and 21:9, assumed for other
+    /// shapes ([`RETAIL_FOV_REFERENCE_ASPECT`], `docs/research/retail/q7a-camera-states.md`). The
+    /// field was a vertical angle named `fov_degrees` until #904; an older settings file keeps that
+    /// key, which is ignored, so the retail default applies.
     pub horizontal_fov_degrees: f32,
     pub vsync: bool,
     pub window_mode: usize,
@@ -131,6 +133,15 @@ pub struct RenderingSettings {
     pub diagnostic_asset_fallbacks: bool,
     /// [`crate::visual_profile::VisualProfile`] index; read only at startup.
     pub visual_profile: usize,
+    /// The grade mode the user chose under the `skyrim` profile, or `None` while they have not
+    /// chosen one. `color_grade` is the `mudcrab` choice and stays the file's value for older
+    /// builds. Under `skyrim` a saved `color_grade` is ignored: the approved grade is a Mudcrab
+    /// artistic override, so `skyrim` starts with the grade off unless this field says otherwise.
+    pub skyrim_color_grade: Option<usize>,
+    /// True while the running profile is `skyrim`. Not saved: it says which grade default and
+    /// which saved slot `color_grade` belongs to in this session.
+    #[serde(skip)]
+    pub running_skyrim: bool,
     /// Session-only window size from an interactive start shot, in logical points like
     /// [`WINDOW_SIZES`]. A window control edit or reset returns to the selected preference size;
     /// this value is never serialized.
@@ -216,8 +227,31 @@ impl Default for RenderingSettings {
             io_threads: config.io_threads,
             diagnostic_asset_fallbacks: config.diagnostic_asset_fallbacks,
             visual_profile: config.visual_profile.index(),
+            skyrim_color_grade: None,
+            running_skyrim: false,
             window_size_override: None,
         }
+    }
+}
+
+/// The settings menu status line before any load notice.
+const SETTINGS_STATUS_HINT: &str =
+    "Changes apply now except startup settings. Choose Save to keep them across runs.";
+
+impl RenderingSettings {
+    /// What Reset restores for this session. The grade and the visual profile row follow the
+    /// running profile, so Reset then Save under `skyrim` does not switch the next start to
+    /// `mudcrab`.
+    pub fn profile_defaults(&self) -> Self {
+        let mut defaults = Self::default();
+        if self.running_skyrim {
+            defaults.color_grade = crate::visual_profile::VisualProfile::Skyrim
+                .default_color_grade()
+                .index();
+            defaults.visual_profile = crate::visual_profile::VisualProfile::Skyrim.index();
+            defaults.running_skyrim = true;
+        }
+        defaults
     }
 }
 
@@ -377,7 +411,7 @@ pub static SETTING_SPECS: &[SettingSpec] = &[
             "Khronos PBR neutral",
         ]
     ),
-    number!(Graphics, "Image", "Horizontal field of view (degrees)", horizontal_fov_degrees; crate::config::FOV_RANGE_DEGREES.0 as f64, crate::config::FOV_RANGE_DEGREES.1 as f64, 5.0),
+    number!(Graphics, "Image", "Horizontal field of view at 16:9 (degrees)", horizontal_fov_degrees; crate::config::FOV_RANGE_DEGREES.0 as f64, crate::config::FOV_RANGE_DEGREES.1 as f64, 5.0),
     choice!(
         "Image",
         "Visual profile (restart)",
@@ -450,7 +484,7 @@ impl SettingSpec {
         {
             return false;
         }
-        (self.read)(settings) != (self.read)(&RenderingSettings::default())
+        (self.read)(settings) != (self.read)(&settings.profile_defaults())
     }
 
     pub fn value_label(&self, settings: &RenderingSettings) -> String {
@@ -668,6 +702,34 @@ impl RenderingSettings {
         self.shadow_cascades = config.sun_shadow_cascades;
     }
 
+    /// Picks the grade for the profile this run will use. Saved settings come from any build, and
+    /// the profile they name is applied after this runs, so this settles the profile first.
+    ///
+    /// Under `skyrim` the file's `color_grade` is the `mudcrab` choice and does not apply. The grade
+    /// is `skyrim_color_grade` when the user saved one, and the profile default otherwise. An
+    /// explicit `--color-grade` still wins (the config check refuses it under `skyrim`).
+    fn apply_profile_grade(&mut self, config: &mut EngineConfig) {
+        use crate::visual_profile::VisualProfile;
+        let Some(profile) = VisualProfile::from_index(self.visual_profile) else {
+            return;
+        };
+        if profile != VisualProfile::Skyrim {
+            return;
+        }
+        let explicit = config
+            .settings_overrides
+            .iter()
+            .any(|flag| flag == "--color-grade");
+        if explicit {
+            return;
+        }
+        let saved = self
+            .skyrim_color_grade
+            .filter(|index| crate::color_pipeline::SceneGradeMode::from_index(*index).is_some());
+        config.color_grade = profile.default_color_grade();
+        self.color_grade = saved.unwrap_or(config.color_grade.index());
+    }
+
     fn retain_explicit_launch_values(&mut self, config: &EngineConfig) {
         let mut launch = RenderingSettings::default();
         launch.take_launch_values(config);
@@ -865,7 +927,7 @@ impl SettingsFile {
         self.note_grade_mode_selection();
         self.metal_drawing_default_available = true;
         self.metal_drawing_auto_unowned = true;
-        *settings = RenderingSettings::default();
+        *settings = settings.profile_defaults();
         if let Some(coverage) = self.grass_coverage.as_mut()
             && self
                 .launch_overrides
@@ -933,6 +995,24 @@ impl SettingsFile {
         if self.preserve_unavailable_record_mode && !self.unavailable_record_mode_replaced {
             persisted.color_grade = self.stored.color_grade;
         }
+        if settings.running_skyrim {
+            // `color_grade` holds the `skyrim` choice this session. The file's `color_grade` is
+            // the `mudcrab` choice and must survive a `skyrim` run. The `skyrim` choice is saved
+            // only once the user moves off the default or has saved one before.
+            let default = crate::visual_profile::VisualProfile::Skyrim
+                .default_color_grade()
+                .index();
+            persisted.skyrim_color_grade = (settings.color_grade != default
+                || self.stored.skyrim_color_grade.is_some())
+            .then_some(settings.color_grade);
+            persisted.color_grade = self.stored.color_grade;
+            if self.preserve_unavailable_record_mode && !self.unavailable_record_mode_replaced {
+                persisted.skyrim_color_grade = self.stored.skyrim_color_grade;
+            }
+        } else {
+            persisted.skyrim_color_grade = self.stored.skyrim_color_grade;
+        }
+        persisted.running_skyrim = false;
         persisted
     }
 }
@@ -979,8 +1059,7 @@ pub(crate) fn prepare_settings_at(
     let no_preferences_path = path.is_none();
     let mut file = SettingsFile {
         path,
-        status: "Changes apply now except startup settings. Choose Save to keep them across runs."
-            .into(),
+        status: SETTINGS_STATUS_HINT.into(),
         stored: RenderingSettings::default(),
         launch_overrides: config.settings_overrides.clone(),
         grass_coverage: None,
@@ -1013,6 +1092,18 @@ pub(crate) fn prepare_settings_at(
                                     && raw.get("occlusion_culling").is_none()
                             });
                         settings.retain_explicit_launch_values(config);
+                        settings.apply_profile_grade(config);
+                        if settings.visual_profile
+                            == crate::visual_profile::VisualProfile::Skyrim.index()
+                            && file.stored.skyrim_color_grade.is_none()
+                            && file.stored.color_grade != config.color_grade.index()
+                            && !config
+                                .settings_overrides
+                                .iter()
+                                .any(|flag| flag == "--color-grade")
+                        {
+                            file.status = "The saved grade mode belongs to the mudcrab profile. The skyrim profile starts with the grade off. Choose a grade mode and Save to keep one for skyrim.".into();
+                        }
                         if let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&bytes)
                             && raw.get("fov_degrees").is_some()
                             && raw.get("horizontal_fov_degrees").is_none()
@@ -1024,9 +1115,15 @@ pub(crate) fn prepare_settings_at(
                                 default,
                                 "saved vertical field of view ignored; the horizontal default applies"
                             );
-                            file.status = format!(
+                            let fov = format!(
                                 "The saved vertical field of view was replaced by the horizontal default of {default} degrees."
                             );
+                            // Keep an earlier status line, such as the skyrim grade notice.
+                            file.status = if file.status == SETTINGS_STATUS_HINT {
+                                fov
+                            } else {
+                                format!("{} {fov}", file.status)
+                            };
                         }
                         if settings.color_grade
                             == crate::color_pipeline::SceneGradeMode::RecordSrgb.index()
@@ -1038,7 +1135,7 @@ pub(crate) fn prepare_settings_at(
                         {
                             settings.color_grade = config.color_grade.index();
                             file.preserve_unavailable_record_mode = true;
-                            file.status = "Saved record-srgb grade is unavailable without an explicit image-space selection; using the approved default.".into();
+                            file.status = "Saved record-srgb grade is unavailable without an explicit image-space selection; using the profile's default grade.".into();
                         }
                     }
                     Err(error) => {
@@ -1083,6 +1180,7 @@ pub(crate) fn prepare_settings_at(
     {
         config.visual_profile = profile;
     }
+    settings.running_skyrim = config.visual_profile == crate::visual_profile::VisualProfile::Skyrim;
     (settings, file)
 }
 
@@ -1158,9 +1256,6 @@ pub(crate) struct RenderSettingsTargets<'w, 's> {
         With<StreamingCamera>,
     >,
     reflections: Query<'w, 's, (Entity, Ref<'static, crate::render::WaterReflectionCamera>)>,
-    /// The aspect ratio the cameras had when the settings were last applied. The vertical angle
-    /// follows it (#904), so a resized window applies them again.
-    last_aspect: Local<'s, f32>,
     /// The game clock, for the hour of the weather-driven sky palette.
     clock: Option<Res<'w, crate::sun::GameClock>>,
     /// The sun and the "a sun light appeared since the last apply" check need conflicting
@@ -1293,17 +1388,27 @@ fn apply_metal_direct_default(
     }
 }
 
-/// The vertical field of view in radians that gives `horizontal_degrees` across a window of
-/// `aspect` (width over height). Retail's field of view keys are horizontal angles; Bevy's
-/// projection takes the vertical one (#904). An aspect ratio that is not a positive finite number
-/// is the one a camera has before its first frame; it is taken as square.
-pub fn vertical_fov_radians(horizontal_degrees: f32, aspect: f32) -> f32 {
-    let aspect = if aspect.is_finite() && aspect > 0.0 {
-        aspect
-    } else {
-        1.0
-    };
-    crate::shots::vertical_fov_degrees(horizontal_degrees, aspect).to_radians()
+/// The window shape retail's field of view keys are defined at. Retail holds the vertical angle
+/// and shows more at the sides of a wider window (Hor+): FOV 80 is 80 degrees across a 16:9
+/// window, and the vertical angle stays the same on other windows, measured at 4:3, 16:9 and
+/// 21:9, assumed for other shapes
+/// (`docs/research/retail/q7a-camera-states.md`, "Window shape").
+pub const RETAIL_FOV_REFERENCE_ASPECT: f32 = 16.0 / 9.0;
+
+/// Bevy's vertical angle for a retail field of view key: the vertical angle of that many degrees
+/// across 16:9, held on every window (measured at 4:3, 16:9 and 21:9, assumed for other shapes).
+pub fn retail_vertical_fov_radians(horizontal_degrees: f32) -> f32 {
+    crate::shots::vertical_fov_degrees(horizontal_degrees, RETAIL_FOV_REFERENCE_ASPECT).to_radians()
+}
+
+/// The retail-convention angle that frames a `--shots` pose. A pose's `hfov` is the angle across
+/// its own frame, so its vertical angle is expressed again as the angle across 16:9.
+pub fn retail_fov_for_frame(hfov_degrees: f32, aspect: f32) -> f32 {
+    let half_vertical = crate::shots::vertical_fov_degrees(hfov_degrees, aspect).to_radians() * 0.5;
+    (half_vertical.tan() * RETAIL_FOV_REFERENCE_ASPECT)
+        .atan()
+        .to_degrees()
+        * 2.0
 }
 
 /// Apply only on preference changes. Weather, light budgets and water read the same resource.
@@ -1343,19 +1448,7 @@ pub(crate) fn apply_render_settings(
     // against the snapshot left by the previous run, and also run when the engine config or the
     // renderer changed underneath it, or when a render target appeared since the last run.
     // A settled frame returns here and does none of the work below.
-    // The vertical angle follows the aspect ratio, so a resized window needs the pass too.
-    let aspect = targets
-        .cameras
-        .iter()
-        .find_map(|(.., projection, _)| match projection {
-            Projection::Perspective(p) if p.aspect_ratio.is_finite() && p.aspect_ratio > 0.0 => {
-                Some(p.aspect_ratio)
-            }
-            _ => None,
-        });
-    let aspect_changed = aspect.is_some_and(|aspect| (aspect - *targets.last_aspect).abs() > 1e-4);
-    let preferences_changed = aspect_changed
-        || settings.is_changed()
+    let preferences_changed = settings.is_changed()
         || previous.as_ref() != Some(&*settings)
         || config.is_changed()
         || adapter.as_ref().is_some_and(|adapter| adapter.is_changed())
@@ -1363,9 +1456,6 @@ pub(crate) fn apply_render_settings(
         || !targets.sun.p1().is_empty();
     if !preferences_changed {
         return;
-    }
-    if let Some(aspect) = aspect {
-        *targets.last_aspect = aspect;
     }
     let before_coverage = (settings.stream_radius, settings.unload_radius);
     retain_live_grass_coverage(settings.reborrow(), &config);
@@ -1511,14 +1601,18 @@ pub(crate) fn apply_render_settings(
     for (entity, mut exposure, mut tone_map, mut msaa, mut projection, camera) in
         &mut targets.cameras
     {
-        exposure.ev100 = settings.exposure_ev100;
+        exposure.ev100 = config
+            .visual_profile
+            .scene_exposure_ev100(settings.exposure_ev100);
         if tone.mode == crate::tone_mapping::SceneToneMapMode::Tony {
-            *tone_map = TONE_MAPS[settings.tone_map];
+            *tone_map = config
+                .visual_profile
+                .display_tonemapping(TONE_MAPS[settings.tone_map]);
         }
         *msaa = MSAA_MODES[settings.msaa];
         // A shots or matched-route run frames each pose itself, from that pose's own angle.
         if !shot_driven && let Projection::Perspective(p) = &mut *projection {
-            p.fov = vertical_fov_radians(settings.horizontal_fov_degrees, p.aspect_ratio);
+            p.fov = retail_vertical_fov_radians(settings.horizontal_fov_degrees);
         }
         apply_camera_features(&mut commands, entity, &settings, drawing, camera.is_added());
     }
@@ -1526,17 +1620,29 @@ pub(crate) fn apply_render_settings(
         commands.entity(entity).insert(MSAA_MODES[settings.msaa]);
         apply_camera_features(&mut commands, entity, &settings, drawing, camera.is_added());
     }
+    // Under `skyrim` the weather and the cell own the sun and ambient levels and colours, in
+    // retail units (`retail_lighting.rs`, #1006): the menu's values are `mudcrab`'s lux. Its sun
+    // switch still applies.
+    let retail = crate::retail_lighting::LightUnits::of(config.visual_profile).is_retail();
     for (mut light, mut cascades) in &mut targets.sun.p0() {
-        light.illuminance = if settings.sun {
-            settings.sun_illuminance
-        } else {
-            0.0
-        };
-        light.color = Color::srgb(
-            settings.sun_color[0],
-            settings.sun_color[1],
-            settings.sun_color[2],
-        );
+        if !retail {
+            light.illuminance = if settings.sun {
+                settings.sun_illuminance
+            } else {
+                0.0
+            };
+            light.color = Color::srgb(
+                settings.sun_color[0],
+                settings.sun_color[1],
+                settings.sun_color[2],
+            );
+        } else if !settings.sun {
+            light.illuminance = 0.0;
+        } else if light.illuminance == 0.0 {
+            light.illuminance = crate::retail_lighting::LightUnits::Retail
+                .startup_levels()
+                .0;
+        }
         light.shadow_maps_enabled = settings.sun && settings.shadows;
         *cascades = crate::app::sun_shadow_cascades_for(
             &config,
@@ -1544,7 +1650,7 @@ pub(crate) fn apply_render_settings(
             settings.shadow_distance_scale,
         );
     }
-    if let Some(ambient) = targets.ambient.as_deref_mut() {
+    if !retail && let Some(ambient) = targets.ambient.as_deref_mut() {
         ambient.brightness = settings.ambient_brightness;
         ambient.color = Color::srgb(
             settings.ambient_color[0],
@@ -3309,8 +3415,7 @@ mod tests {
         assert_eq!(persisted.color_grade, saved.color_grade);
         assert!(persisted.point_lights);
         assert!(persisted.hud);
-        let (reloaded, file) =
-            prepare_settings_at(&mut EngineConfig::default(), Some(path.clone()));
+        let (reloaded, file) = prepare_settings_at(&mut EngineConfig::default(), Some(path));
         assert_eq!(
             reloaded.color_grade,
             crate::color_pipeline::SceneGradeMode::SnapshotSrgb.index()
@@ -3435,6 +3540,229 @@ mod tests {
         );
         let (reloaded, _) = prepare_settings_at(&mut EngineConfig::default(), Some(path));
         assert_eq!(reloaded.color_grade, persisted.color_grade);
+    }
+
+    const GRADE_OFF: usize = 0;
+    const GRADE_SATURATION: usize = 1;
+    const GRADE_FULL: usize = 2;
+    const GRADE_APPROVED: usize = 3;
+
+    fn grade_args(profile: Option<&str>) -> Vec<String> {
+        profile
+            .map(|profile| vec!["--visual-profile".to_owned(), profile.to_owned()])
+            .unwrap_or_default()
+    }
+
+    /// Load `path` the way an interactive start does and return the settings, file and config.
+    fn grade_session(
+        path: &Path,
+        profile: Option<&str>,
+    ) -> (RenderingSettings, SettingsFile, EngineConfig) {
+        let mut config = launch(&grade_args(profile));
+        let (settings, file) = prepare_settings_at(&mut config, Some(path.to_owned()));
+        (settings, file, config)
+    }
+
+    fn read_saved(path: &Path) -> RenderingSettings {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn grade_defaults_follow_the_profile_without_saved_settings() {
+        let mudcrab = launch(&[]);
+        assert_eq!(
+            mudcrab.color_grade,
+            crate::color_pipeline::SceneGradeMode::SnapshotSrgb
+        );
+        let skyrim = launch(&grade_args(Some("skyrim")));
+        assert_eq!(
+            skyrim.color_grade,
+            crate::color_pipeline::SceneGradeMode::Off
+        );
+        let mut config = launch(&grade_args(Some("skyrim")));
+        let (settings, _) = prepare_settings_at(&mut config, None);
+        assert_eq!(settings.color_grade, GRADE_OFF);
+        assert_eq!(
+            config.color_grade,
+            crate::color_pipeline::SceneGradeMode::Off
+        );
+        assert!(settings.running_skyrim);
+        let mut config = launch(&[]);
+        let (settings, _) = prepare_settings_at(&mut config, None);
+        assert_eq!(settings.color_grade, GRADE_APPROVED);
+        assert!(!settings.running_skyrim);
+    }
+
+    #[test]
+    fn saved_grade_from_an_older_build_does_not_turn_the_grade_on_under_skyrim() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        // The shape older builds wrote: one grade mode, no skyrim slot.
+        for saved_grade in [GRADE_APPROVED, GRADE_FULL, GRADE_SATURATION] {
+            for (saved_profile, launch_profile) in [(1, None), (0, Some("skyrim"))] {
+                std::fs::write(
+                    &path,
+                    format!(
+                        r#"{{"version":1,"color_grade":{saved_grade},"visual_preset":1,"visual_profile":{saved_profile}}}"#
+                    ),
+                )
+                .unwrap();
+                let (settings, file, config) = grade_session(&path, launch_profile);
+                assert_eq!(settings.color_grade, GRADE_OFF, "saved {saved_grade}");
+                assert_eq!(
+                    config.color_grade,
+                    crate::color_pipeline::SceneGradeMode::Off
+                );
+                assert_eq!(
+                    config.visual_profile,
+                    crate::visual_profile::VisualProfile::Skyrim
+                );
+                assert!(settings.running_skyrim);
+                if saved_profile == 1 {
+                    assert!(
+                        file.status
+                            .contains("skyrim profile starts with the grade off")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saved_grade_still_applies_under_mudcrab() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"color_grade":2,"visual_preset":1,"visual_profile":0}"#,
+        )
+        .unwrap();
+        let (settings, _, config) = grade_session(&path, None);
+        assert_eq!(settings.color_grade, GRADE_FULL);
+        assert_eq!(config.color_grade.index(), GRADE_FULL);
+        assert!(!settings.running_skyrim);
+        // A skyrim choice in the file does not leak into a mudcrab run.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"color_grade":2,"visual_profile":0,"skyrim_color_grade":1}"#,
+        )
+        .unwrap();
+        let (settings, _, _) = grade_session(&path, None);
+        assert_eq!(settings.color_grade, GRADE_FULL);
+    }
+
+    #[test]
+    fn explicit_menu_choice_under_skyrim_is_saved_apart_from_the_mudcrab_choice() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"color_grade":2,"visual_preset":1,"visual_profile":1}"#,
+        )
+        .unwrap();
+        let (mut settings, mut file, _) = grade_session(&path, None);
+        assert_eq!(settings.color_grade, GRADE_OFF);
+        // Saving without a grade edit keeps the file's grade and pins nothing for skyrim.
+        file.save(&settings);
+        let saved = read_saved(&path);
+        assert_eq!(saved.color_grade, GRADE_FULL);
+        assert_eq!(saved.skyrim_color_grade, None);
+        assert!(!saved.running_skyrim);
+        let (settings_again, _, _) = grade_session(&path, None);
+        assert_eq!(settings_again.color_grade, GRADE_OFF);
+
+        // The user picks a grade in the menu and saves.
+        settings.color_grade = GRADE_SATURATION;
+        file.save(&settings);
+        let saved = read_saved(&path);
+        assert_eq!(saved.skyrim_color_grade, Some(GRADE_SATURATION));
+        assert_eq!(saved.color_grade, GRADE_FULL, "the mudcrab choice survives");
+        let (settings_skyrim, _, config) = grade_session(&path, None);
+        assert_eq!(settings_skyrim.color_grade, GRADE_SATURATION);
+        assert_eq!(
+            config.color_grade,
+            crate::color_pipeline::SceneGradeMode::Saturation
+        );
+
+        // Going back to Off after a saved choice keeps the explicit choice recorded as Off.
+        let mut settings = settings_skyrim;
+        settings.color_grade = GRADE_OFF;
+        let (_, mut file, _) = grade_session(&path, None);
+        file.save(&settings);
+        assert_eq!(read_saved(&path).skyrim_color_grade, Some(GRADE_OFF));
+
+        // A mudcrab start reads the mudcrab choice only.
+        let mut mudcrab = read_saved(&path);
+        mudcrab.visual_profile = 0;
+        save_settings(&path, &mudcrab).unwrap();
+        let (settings_mudcrab, _, _) = grade_session(&path, None);
+        assert_eq!(settings_mudcrab.color_grade, GRADE_FULL);
+    }
+
+    #[test]
+    fn saving_from_mudcrab_keeps_the_saved_skyrim_choice() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"color_grade":2,"visual_profile":0,"skyrim_color_grade":1}"#,
+        )
+        .unwrap();
+        let (mut settings, mut file, _) = grade_session(&path, None);
+        settings.color_grade = GRADE_APPROVED;
+        file.save(&settings);
+        let saved = read_saved(&path);
+        assert_eq!(saved.color_grade, GRADE_APPROVED);
+        assert_eq!(saved.skyrim_color_grade, Some(GRADE_SATURATION));
+    }
+
+    #[test]
+    fn reset_under_skyrim_restores_the_off_grade() {
+        let mut config = launch(&grade_args(Some("skyrim")));
+        let (mut settings, mut file) = prepare_settings_at(&mut config, None);
+        let grade = SETTING_SPECS
+            .iter()
+            .find(|spec| spec.label == "Grade mode")
+            .unwrap();
+        assert!(!grade.is_modified(&settings), "Off is the skyrim default");
+        settings.color_grade = GRADE_FULL;
+        assert!(grade.is_modified(&settings));
+        file.restore_defaults(&mut settings);
+        assert_eq!(settings.color_grade, GRADE_OFF);
+        assert!(settings.running_skyrim);
+        // Reset keeps the running profile, so a later Save does not switch to mudcrab.
+        assert_eq!(
+            settings.visual_profile,
+            crate::visual_profile::VisualProfile::Skyrim.index()
+        );
+        assert!(!grade.is_modified(&settings));
+        // The same menu under mudcrab still treats the approved grade as the default.
+        let mut config = launch(&[]);
+        let (mut settings, mut file) = prepare_settings_at(&mut config, None);
+        assert!(!grade.is_modified(&settings));
+        settings.color_grade = GRADE_OFF;
+        assert!(grade.is_modified(&settings));
+        file.restore_defaults(&mut settings);
+        assert_eq!(settings.color_grade, GRADE_APPROVED);
+    }
+
+    #[test]
+    fn skyrim_grade_off_resolves_to_no_post_grade_and_leaves_the_tonemapper_alone() {
+        use crate::color_pipeline::{SceneGradeMode, SceneGradeSource, SceneVisualPreset};
+        let source = SceneGradeSource::default();
+        let tone = crate::tone_mapping::SceneToneMapSource::default();
+        let preset = SceneVisualPreset::CoolGray;
+        let off = tone.resolve(&source, SceneGradeMode::Off, preset).unwrap();
+        let approved = tone
+            .resolve(&source, SceneGradeMode::SnapshotSrgb, preset)
+            .unwrap();
+        assert_eq!(off.post.enabled, 0.0);
+        assert_eq!(approved.post.enabled, 1.0);
+        assert_eq!(off.bevy_saturation, 1.0);
+        // The grade mode does not pick the tonemapper or the retail curve fields.
+        assert_eq!(off.tonemapping, approved.tonemapping);
+        assert_eq!(off.post.tone_operator, approved.post.tone_operator);
+        assert_eq!(off.post.tone_coefficient, approved.post.tone_coefficient);
     }
 
     #[test]
@@ -3749,38 +4077,12 @@ mod tests {
         else {
             panic!("expected perspective");
         };
-        assert!((projection.fov.to_degrees() - 70.0).abs() < 0.001);
+        assert!((projection.fov - retail_vertical_fov_radians(70.0)).abs() < 1e-6);
         assert_eq!(
             app.world().resource::<RenderAssetBytesPerFrame>().max_bytes,
             None
         );
         assert_eq!(app.world().resource::<EngineConfig>().io_threads, 0);
-    }
-
-    /// #904: retail's field of view is horizontal, so the vertical angle depends on the window.
-    #[test]
-    fn horizontal_field_of_view_converts_by_aspect_ratio() {
-        for (name, aspect, vertical) in [
-            ("16:9", 16.0 / 9.0, 50.54),
-            ("16:10", 16.0 / 10.0, 55.34),
-            ("21:9", 21.0 / 9.0, 39.57),
-            ("4:3", 4.0 / 3.0, 64.4),
-        ] {
-            let got = vertical_fov_radians(80.0, aspect).to_degrees();
-            assert!((got - vertical).abs() < 0.1, "{name}: {got} vs {vertical}");
-            // The defining relation of a rectilinear projection.
-            let horizontal = ((got.to_radians() * 0.5).tan() * aspect).atan() * 2.0;
-            assert!((horizontal.to_degrees() - 80.0).abs() < 1e-3, "{name}");
-        }
-        // A square window shows the same angle both ways; a camera that has not seen a window yet
-        // reports an aspect ratio that is not usable and is taken as square.
-        assert!((vertical_fov_radians(80.0, 1.0).to_degrees() - 80.0).abs() < 1e-3);
-        for unusable in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-            assert_eq!(
-                vertical_fov_radians(80.0, unusable),
-                vertical_fov_radians(80.0, 1.0)
-            );
-        }
     }
 
     /// #904, #949: with no INI the camera starts at retail's 80 degrees horizontal, and the
@@ -3863,10 +4165,11 @@ mod tests {
         assert_eq!(settings.horizontal_fov_degrees, 100.0);
     }
 
-    /// The vertical angle follows the window: a resize applies the field of view again, and a
-    /// shots run keeps the angle of its own pose.
+    /// Retail holds the vertical angle (Hor+, `docs/research/retail/q7a-camera-states.md`): a
+    /// resized window keeps it and shows more or less at the sides. A shots run keeps the angle of
+    /// its own pose.
     #[test]
-    fn a_resized_window_keeps_the_horizontal_field_of_view() {
+    fn a_resized_window_keeps_the_vertical_field_of_view() {
         for (shots, resized) in [(None, true), (Some(PathBuf::from("shots.json")), false)] {
             let mut app = App::new();
             app.add_plugins(MinimalPlugins)
@@ -3913,8 +4216,45 @@ mod tests {
                 p.aspect_ratio = 21.0 / 9.0;
             }
             app.update();
-            assert!((fov(&app).to_degrees() - 39.57).abs() < 0.1);
+            assert!((fov(&app).to_degrees() - 50.54).abs() < 0.1, "Hor+");
         }
+    }
+
+    /// Measured on retail: FOV 80 is 80 degrees across 16:9 and the vertical angle is held, so a
+    /// 4:3 window shows 64.4 degrees across and a 21:9 window 95.5. 16:10, 32:9 and the portrait
+    /// 9:16 are not measured; they follow the same rule, and the portrait case catches an
+    /// inverted aspect ratio.
+    #[test]
+    fn retail_field_of_view_is_horizontal_at_16_9_and_held_vertically() {
+        let vertical = retail_vertical_fov_radians(80.0);
+        assert!((vertical.to_degrees() - 50.534).abs() < 1e-2);
+        for (name, aspect, across) in [
+            ("16:9", 16.0 / 9.0, 80.0),
+            ("4:3", 4.0 / 3.0, 64.37),
+            ("21:9", 21.0_f32 / 9.0, 95.52),
+            ("16:10", 16.0 / 10.0, 74.12),
+            ("32:9", 32.0 / 9.0, 118.42),
+            ("9:16 portrait", 9.0 / 16.0, 29.74),
+        ] {
+            let shown = ((vertical * 0.5).tan() * aspect).atan().to_degrees() * 2.0;
+            assert!((shown - across).abs() < 0.05, "{name}: {shown}");
+        }
+        // A shots pose holds its own angle across its own frame; its retail-convention angle gives
+        // back the same vertical angle.
+        for (hfov, aspect) in [
+            (80.0, 16.0 / 9.0),
+            (18.0, 1379.0 / 911.0),
+            (75.0, 4.0 / 3.0),
+            (30.0, 9.0 / 16.0),
+        ] {
+            let retail = retail_fov_for_frame(hfov, aspect);
+            let own = crate::shots::vertical_fov_degrees(hfov, aspect).to_radians();
+            assert!(
+                (retail_vertical_fov_radians(retail) - own).abs() < 1e-5,
+                "{hfov} at {aspect}"
+            );
+        }
+        assert!((retail_fov_for_frame(80.0, 16.0 / 9.0) - 80.0).abs() < 1e-3);
     }
 
     #[test]

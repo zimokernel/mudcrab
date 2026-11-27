@@ -32,7 +32,10 @@
 //! unshadowed, so an unflagged light also lights the far side of the wall it is mounted on, as in
 //! retail.
 
-use crate::world::{components::StreamingCamera, database::LightRow};
+use crate::{
+    retail_lighting::LightUnits,
+    world::{components::StreamingCamera, database::LightRow},
+};
 use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
 
@@ -53,8 +56,10 @@ pub const LIGHT_FLAG_NEGATIVE: u32 = 0x0000_0004;
 /// Global environment policy, independent of the local-light compatibility transform.
 pub const AMBIENT_ILLUMINANCE: f32 = SUN_ILLUMINANCE / (core::f32::consts::PI * SUNLIGHT_SCALE);
 
-/// The sun's illuminance in the world path, in lux. With the scene's EV100 of 9.7 this puts a
-/// white surface facing the sun at about 3.8 in linear radiance before tone mapping.
+/// The sun's illuminance in the `mudcrab` world path, in lux. With that profile's EV100 of 9.7
+/// this puts a white surface facing the sun at about 3.8 in linear radiance before tone mapping.
+/// The `skyrim` profile does not use it: its lights are in retail units (`retail_lighting.rs`,
+/// [near-lighting.md](../../../docs/specs/engine/near-lighting.md)).
 pub const SUN_ILLUMINANCE: f32 = 12_000.0;
 
 /// How much brighter than the ambient cube Skyrim's `SunlightScale` makes the sun's colour
@@ -104,7 +109,7 @@ impl LightEvaluation {
         self.source.flags & LIGHT_FLAG_SHADOW_MODES != 0
     }
 
-    /// The actual streaming consumer uses this conversion for both immediate and deferred lights.
+    /// The `mudcrab` conversion.
     pub fn point_light(&self) -> Option<PointLight> {
         if self.suppressed_flags {
             return None;
@@ -120,6 +125,61 @@ impl LightEvaluation {
             shadow_maps_enabled: false,
             ..default()
         })
+    }
+
+    /// The actual streaming consumer uses this conversion for both immediate and deferred lights.
+    ///
+    /// Under [`LightUnits::Retail`] (SPEC-1 section 2.6) the colour is the record bytes / 255 with
+    /// no sRGB decode, and the product `colour x fade` has no clamp: a Negative light (`DATA` flag
+    /// `0x4`) or a negative fade gives a negative colour. `emittance` is the colour of the
+    /// reference's `XEMI` source: it multiplies the record colour, and the Negative flag is then
+    /// not applied again.
+    ///
+    /// The caller passes the source's colour for the game hour (`crate::emittance`).
+    ///
+    /// STAND-IN(#362): only a reference with `XEMI` takes a source; retail also lists a light
+    /// whose model has an external-emittance property (inferred from one run).
+    pub fn point_light_in(
+        &self,
+        units: LightUnits,
+        emittance: Option<[u8; 3]>,
+    ) -> Option<PointLight> {
+        if !units.is_retail() {
+            return self.point_light();
+        }
+        if self.source.flags & LIGHT_FLAG_OFF_BY_DEFAULT != 0 {
+            return None;
+        }
+        let record = Vec3::from_array(self.source.color.map(f32::from)) / 255.0;
+        let (colour, sign) = match emittance {
+            Some(source) => (
+                record * Vec3::from_array(source.map(f32::from)) / 255.0,
+                1.0,
+            ),
+            None if self.source.flags & LIGHT_FLAG_NEGATIVE != 0 => (record, -1.0),
+            None => (record, 1.0),
+        };
+        let colour = colour * sign * self.retail_fade().signum();
+        Some(PointLight {
+            color: Color::linear_rgb(colour.x, colour.y, colour.z),
+            intensity: units.point_intensity(self.retail_fade().abs()),
+            range: self.backend_range?,
+            shadow_maps_enabled: false,
+            ..default()
+        })
+    }
+
+    /// The fade the retail path scales the colour by: `FNAM` plus the reference offset, with no
+    /// clamp.
+    pub fn retail_fade(&self) -> f32 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a sum of two f32 values, bounded by the f32 range below"
+        )]
+        let fade = self
+            .authored_fade
+            .clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32;
+        fade
     }
 }
 
@@ -283,6 +343,14 @@ fn record_light_coverage(
     }
 }
 
+// STAND-IN(#999): retail gives one geometry at most 7 point lights (after the sun and up to 4
+// shadow lights), cut in the order of the geometry's own light list, not by distance. Bevy's
+// clustered forward lights loop over the lights of a cluster, not of a mesh, and the cluster
+// order is not attach order, so a per-fragment cap of 7 would cut arbitrarily and flicker as the
+// camera moves. Mudcrab keeps the nearest lights instead, so it uses more lights per geometry
+// than retail. Source: the NEEDS 20 findings,
+// [skyrim_decomp PR 1073](https://github.com/Mudcrab-Team/skyrim_decomp/pull/1073).
+
 /// How many of the spawned lights are enabled at once. Bevy's clustered forward renderer draws
 /// every enabled light in a cluster it reaches, and the game's spaces hold whole halls of `LIGH`
 /// references, so the far ones are switched off rather than paid for.
@@ -400,6 +468,26 @@ fn retail_intensity_f64(fade: f32) -> f64 {
         * f64::from(fade)
 }
 
+impl LightEvaluation {
+    /// The distance dimmer, flicker and pulse state of this light (see [`crate::light_dynamics`]).
+    /// `seed` is the reference's form id.
+    pub fn dynamics(&self, seed: u32) -> crate::light_dynamics::LightDynamics {
+        crate::light_dynamics::LightDynamics::new(self, seed)
+    }
+
+    /// [`Self::dynamics`] for the light [`Self::point_light_in`] builds in `units`.
+    pub fn dynamics_in(
+        &self,
+        units: LightUnits,
+        seed: u32,
+    ) -> crate::light_dynamics::LightDynamics {
+        match units {
+            LightUnits::Mudcrab => self.dynamics(seed),
+            LightUnits::Retail => crate::light_dynamics::LightDynamics::retail(self, seed),
+        }
+    }
+}
+
 /// A [`PointLight`] that came from a Skyrim `LIGH` reference.
 ///
 /// The budget and the tests tell the game's lights from the engine's own by this marker: a
@@ -482,6 +570,7 @@ pub struct LightsPlugin;
 pub(crate) struct DeferredPointLight {
     pub light: PointLight,
     pub marker: SkyrimLight,
+    pub dynamics: crate::light_dynamics::LightDynamics,
 }
 
 fn activate_deferred_lights(
@@ -502,6 +591,7 @@ fn activate_deferred_lights(
             Name::new(format!("Light {:08X}", deferred.marker.form_id)),
             deferred.light,
             deferred.marker,
+            deferred.dynamics.clone(),
             crate::render::light_render_layers(),
         ));
     }
@@ -515,6 +605,10 @@ impl Plugin for LightsPlugin {
             .add_systems(
                 Update,
                 activate_deferred_lights.after(crate::settings_ui::SettingsUiSet),
+            )
+            .add_systems(
+                Update,
+                crate::light_dynamics::update_light_dynamics.after(activate_deferred_lights),
             )
             .add_systems(
                 PostUpdate,
@@ -698,6 +792,7 @@ fn budget_lights(
         if shadow_count > 0 {
             shadow_scratch.extend(enabled.iter().filter_map(|&entity| {
                 // Retail shadows only a light whose record carries a shadow flag.
+                // silent-ok: an enabled entity that lost its light has nothing to shadow, and the changed light count makes the budget choose again.
                 if !markers.get(entity).ok()?.shadow_flagged {
                     return None;
                 }
@@ -801,6 +896,7 @@ mod tests {
                         cell_id: 2,
                         shadow_flagged: true,
                     },
+                    dynamics: evaluate_light(&light_row(512.0, 0), None).dynamics(1),
                 },
             ))
             .id();
@@ -849,6 +945,10 @@ mod tests {
             falloff: None,
             reference_data: None,
             radius_status: None,
+            flicker_period: None,
+            flicker_intensity_amplitude: None,
+            flicker_movement_amplitude: None,
+            reference_never_fades: false,
         }
     }
 
